@@ -58,6 +58,27 @@
 - **查看**：`cat config/login_log.jsonl`（或 `grep 失败 config/login_log.jsonl`、`grep 发布 config/login_log.jsonl`）
 - 普通浏览/查询不记录，避免日志噪音；测试隔离可用环境变量 `APPSTORE_AUDIT_LOG` 指向临时文件
 
+### 发布历史的安全保护
+
+发布历史（`config/tasks_history.json`）清空前有**两道防护**：
+
+1. **必须显式确认**：调 `POST /api/tasks/clear` 要带 `{"confirm": true}`，否则返回 400 不执行（前端没有清空按钮，这个接口只给脚本用，多一步确认不影响日常）
+2. **自动多份备份**：清空前写 `tasks_history.json.bak`（最近一次）+ `tasks_history.json.bak-YYYYmmdd-HHMMSS`（保留最近 5 份，多次清空不会覆盖上一次的备份）
+
+万一误清，恢复办法是把备份条目和当前文件**按 id 合并**（不要直接覆盖，否则会丢掉清空后新产生的记录）：
+
+```python
+import json
+cur = json.load(open("config/tasks_history.json"))
+bak = json.load(open("config/tasks_history.json.bak"))
+seen = {t.get("id") for t in cur}
+merged = cur + [t for t in bak if t.get("id") not in seen]
+merged.sort(key=lambda x: x.get("finished_at") or "", reverse=True)
+json.dump(merged, open("config/tasks_history.json", "w"), ensure_ascii=False, indent=1)
+```
+
+（改完重启看板生效；dry-run 校验任务不会进历史）
+
 ## 局域网访问（同事共用看板）
 
 1. 先按上一节配置好登录账号（**没有账号时局域网模式会拒绝启动**，这是故意的安全闸）。
@@ -195,6 +216,55 @@
 - 复选框全选/清空按钮在平台列表下方
 - Apple 不参与发布（仅查询）
 - 如果你勾选了多个平台，后台会**依次**执行发布
+- 「查询全部平台」是**并发**执行的，总耗时约等于最慢的那个平台（不再是各平台相加）；
+  苹果的商店页面版本按包名缓存 5 分钟，避免每次查询都抓一次大页面
+- 荣耀、应用宝上传 APK 遇到连接中断/超时会**自动重试**（每次从头重传，最多 3 次，指数退避）
+
+### Google Play 状态口径（重要）
+
+Google Play Developer API **没有审核状态字段**（track release 的 status 只有 draft / inProgress / halted / completed，
+没有「审核中 / 待发布 / 被拒」）。因此看板用 **Play 商店页面显示的版本号** 复核「已上架」，
+其余状态按下面口径归类：
+
+- 商店页面版本 == 提交版本 → 已上架
+- 商店页面版本 < 提交版本（提交方式是「全量发布」，status=completed）→ 审核中（尚未在商店生效）
+- 提交方式是「分阶段发布」（status=inProgress + 百万分之一）→ **待发布**（不是「审核中」）
+
+### 为什么「分阶段发布中」显示成「待发布」
+
+Google API 的 inProgress 既可能是「审核中」，也可能是「审核通过后按比例灰度中」，**两者无法区分**。
+我们的分阶段发布比例是百万分之一，约等于没人收得到更新，语义上更接近「还没正式发布」，
+所以统一显示为「待发布」，并在审核状态里写明「X 分阶段发布中（百万分之一，点「全量发布」正式上线）」。
+
+这是一个有意的近似：**「待发布」阶段实际可能仍在审核、也可能已审核通过**；如果 Google 后续在 API 里
+提供真实的「待发布」和「拒绝」字段，再把这里改成准确归类。当前被拒版本也无法可靠判断，
+只能人工到 Play Console 查看。
+
+**自管式发布（Managed Publishing）是 Play Console 里按应用开的全局开关**，不是发布接口能按次传的参数，
+所以「一次分阶段、一次自管式」这种混用做不到。看板能按次选的是**发布方式**（都在标准 / 非自管式账户下）：
+
+- **分阶段发布**：审核通过后先放百万分之一，再在看板点「全量发布」→ 100%（发布表单「Google 发布方式」选「分阶段发布」）
+- **全量发布**：审核通过后 Google 自动 100% 上线（选「全量发布」）
+
+如果要 Play Console 意义上的自管式（审核通过后任何版本都不自动上架、必须去 Play Console 手动点发布），
+去 Play Console 把该应用的「发布管理 → 自管式发布」打开，并把 credentials.json 的 google.managed_publishing 设为 true，
+看板会在审核状态里提示「需在 Play Console 手动发布」。注意它是全局的：分阶段 / 全量都会变成手动发布。
+
+### 小米应用商店状态口径（重要）
+
+小米 dev/query 接口**同样没有审核状态字段**，只返回 packageInfo 里的两个版本号：
+
+- versionName / versionCode：**最新（提审）版本**
+- onlineVersionCode：**线上版本号**（商店已上架；接口不返回线上版本名）
+
+看板用这两个版本号的大小关系推断状态：
+
+- onlineVersionCode < versionCode → 审核中（提审版本还没上线）
+- onlineVersionCode == versionCode → 已上架
+
+这是一个有意的近似：**被拒时接口也不会告诉我们**，所以被拒版本会继续显示成「审核中」；
+等小米后续开放审核状态/拒绝字段后再改成准确归类。审核中时「已上架版本」行为空，
+线上版本号会补进审核状态备注里（例如「6.19.1 审核中（线上版本号 202605181）」）。
 
 ## HTTP API
 
