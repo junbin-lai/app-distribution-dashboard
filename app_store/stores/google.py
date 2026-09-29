@@ -25,6 +25,13 @@ _UPLOAD_TIMEOUT = 300  # 秒，单次 socket 读/写超时（按次生效：健�
                      # 只在网络完全卡死时触发断开重试；过长会让卡死的上传挂半小时，按需在凭证里覆盖）
 _UPLOAD_MAX_RETRIES = 5  # 上传失败自动重试次数
 
+# 商店页面「真正已上架版本」探测结果缓存：避免看板/飞书反复查询时每次抓页面。
+# key=package_name, value=(expire_monotonic, version)。失败结果也缓存（短 TTL），
+# 防止网络抖动时每次都等 30s 超时。
+_PAGE_VERSION_CACHE: Dict[str, tuple] = {}
+_PAGE_VERSION_TTL_SECONDS = 300
+_PAGE_VERSION_FAIL_TTL_SECONDS = 60
+
 
 class _ProgressFile:
     """文件包装：httplib2 分块读文件时回调当前已传大小 → 看板实时显示上传进度。"""
@@ -94,30 +101,39 @@ class GoogleAdapter(StoreAdapter):
     def _play_page_version(self, package_name: str) -> str:
         """从 Google Play 商店页面抓取当前已上架版本（What's New 版本）。
 
-        用于 Managed Publishing 模式下区分"待发布"与"已上架"：
-        页面显示的版本号即真正已上架版本。失败/超时返回空串（不阻塞查询）。
+        API 无审核状态字段，页面显示的版本号才是真正已上架版本；据此区分
+        「已上架」与「API completed 但实际未生效/审核中」。结果按包名缓存，
+        失败/超时返回空串（不阻塞查询）。
         """
+        now = time.monotonic()
+        hit = _PAGE_VERSION_CACHE.get(package_name)
+        if hit is not None and hit[0] > now:
+            return hit[1]
+
+        value = ""
         try:
             import subprocess
             import sys as _sys
             probe = Path(__file__).resolve().parent.parent / "play_version_probe.py"
-            if not probe.is_file():
-                return ""
-            py = getattr(_sys, "executable", "python3")
-            proc = subprocess.run(
-                [py, "-B", str(probe), package_name],
-                capture_output=True, text=True, timeout=30,
-            )
-            if proc.returncode != 0:
-                # 子进程失败输出原因到 stderr（不静默吞掉，便于排查网络/解析问题）
-                err = (proc.stderr or "").strip()
-                print(f"Google Play 页面版本探测失败 (exit {proc.returncode}): {err[:300]}",
-                      file=_sys.stderr)
-                return ""
-            return (proc.stdout or "").strip()
+            if probe.is_file():
+                py = getattr(_sys, "executable", "python3")
+                proc = subprocess.run(
+                    [py, "-B", str(probe), package_name],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if proc.returncode != 0:
+                    # 子进程失败输出原因到 stderr（不静默吞掉，便于排查网络/解析问题）
+                    err = (proc.stderr or "").strip()
+                    print(f"Google Play 页面版本探测失败 (exit {proc.returncode}): {err[:300]}",
+                          file=sys.stderr)
+                else:
+                    value = (proc.stdout or "").strip()
         except Exception as e:
             print(f"Google Play 页面版本探测异常: {e}", file=sys.stderr)
-            return ""
+
+        ttl = _PAGE_VERSION_TTL_SECONDS if value else _PAGE_VERSION_FAIL_TTL_SECONDS
+        _PAGE_VERSION_CACHE[package_name] = (now + ttl, value)
+        return value
 
     def _load_creds(self, pkg: str = "") -> Dict[str, Any]:
         cred = self._cred_for(pkg) if pkg else self.credentials
@@ -268,39 +284,68 @@ class GoogleAdapter(StoreAdapter):
                 scb("提交发布（tracks.update → commit）…")
 
             auto_review = bool((release.metadata or {}).get("auto_review")) or bool(self.credentials.get("auto_review"))
-            track_body = {
-                "track": release.track,
-                "releases": [
-                    {
+            release_mode = str((release.metadata or {}).get("release_mode") or "staged").lower()
+            # 发布方式（勾选「自动送审」时生效）：
+            #   staged = 分阶段发布：inProgress + 百万分之一，审核通过后先放极小比例，再在看板「全量发布」
+            #   full   = 全量发布：completed，审核通过后 Google 自动 100% 上线
+            # 不自动送审时仍存草稿（status=draft，需到 Play Console 手动送审）
+            if auto_review:
+                if release_mode == "full":
+                    release_body = {
                         "name": f"{version_code} ({release.version_name})" if release.version_name else str(version_code),
                         "versionCodes": [str(version_code)],
-                        "status": "draft" if not auto_review else "completed",
+                        "status": "completed",
                         "releaseNotes": (
                             [{"language": "zh-CN", "text": release_notes}] if release_notes else []
                         ),
                     }
-                ],
-            }
+                else:
+                    release_body = {
+                        "name": f"{version_code} ({release.version_name})" if release.version_name else str(version_code),
+                        "versionCodes": [str(version_code)],
+                        "status": "inProgress",
+                        "userFraction": 0.000001,  # 百万分之一，审核通过后几乎无人收到更新
+                        "releaseNotes": (
+                            [{"language": "zh-CN", "text": release_notes}] if release_notes else []
+                        ),
+                    }
+            else:
+                release_body = {
+                    "name": f"{version_code} ({release.version_name})" if release.version_name else str(version_code),
+                    "versionCodes": [str(version_code)],
+                    "status": "draft",
+                    "releaseNotes": (
+                        [{"language": "zh-CN", "text": release_notes}] if release_notes else []
+                    ),
+                }
+            track_body = {"track": release.track, "releases": [release_body]}
             service.edits().tracks().update(
                 packageName=package, editId=edit_id, track=release.track, body=track_body
             ).execute()
 
             if auto_review:
+                # 自动送审：提交 edit 让 Google 开始审核（审核通过后按所选发布方式上线）
                 service.edits().commit(packageName=package, editId=edit_id).execute()
             else:
+                # 存草稿不送审
                 service.edits().commit(
                     packageName=package, editId=edit_id, changesNotSentForReview=True
                 ).execute()
+            mode_note = (
+                "全量发布，审核通过后自动 100% 上线"
+                if auto_review and release_mode == "full"
+                else "分阶段发布，审核通过后按百万分之一比例自动上线，需后续手动调至 100%"
+            )
             return SubmitResult(
                 platform=self.platform,
                 ok=True,
                 message=(
                     f"已提交到 {release.track} 轨道（{path.name}，versionCode {version_code}）"
-                    + ("，已自动送审" if auto_review else "，已保存为草稿（需到 Play Console 手动送审）")
+                    + (f"，已自动送审（{mode_note}）" if auto_review else "，已保存为草稿（需到 Play Console 手动送审）")
                 ),
                 remote_reference=edit_id,
                 state=AuditState.SUBMITTED,
-                raw={"edit_id": edit_id, "version_code": version_code, "is_aab": is_aab},
+                raw={"edit_id": edit_id, "version_code": version_code, "is_aab": is_aab, "release_mode": release_mode},
             )
         except Exception as e:
             # StoreError 路径同样清理已创建的 edit；删除失败只记录，不掩盖原始错误
@@ -380,88 +425,143 @@ class GoogleAdapter(StoreAdapter):
         live_names: List[str] = []
         draft_names: List[str] = []
         reviewing_names: List[str] = []
+        pending_names: List[str] = []
         review_msgs: List[str] = []
         audit_note: str = ""
-        any_in_progress = False
-        any_completed = False
+        release_now = False
+        prod_completed: List[Dict[str, Any]] = []
 
         beta_names: List[str] = []
         alpha_names: List[str] = []
         internal_names: List[str] = []
+
+        def _semver(text: str):
+            m = re.search(r"(\d+\.\d+\.\d+)", text or "")
+            if not m:
+                return None
+            return tuple(int(x) for x in m.group(1).split("."))
+
+        def _ver_text(text: str) -> str:
+            # 展示时只保留版本号，去掉 Google 自带的 versionCode 前缀
+            v = _semver(text)
+            return ".".join(str(x) for x in v) if v else (text or "")
 
         for track in raw_tracks:
             track_name = track.get("track", "?")
             for rel in track.get("releases", []):
                 codes = [c for c in rel.get("versionCodes", [])]
                 name = rel.get("name") or ""
+                nm = _ver_text(name)
                 status = rel.get("status", "")
                 if status == "inProgress":
-                    any_in_progress = True
-                    review_msgs.append(f"{track_name}:审核中 ({name})")
-                    if name and name not in reviewing_names:
-                        reviewing_names.append(name)
-                elif status == "draft":
-                    review_msgs.append(f"{track_name}:草稿未送审 ({name})")
-                    if name and name not in draft_names:
-                        draft_names.append(name)
-                elif status == "completed":
-                    any_completed = True
-                    # 正式版只统计 production 轨道
+                    # 分阶段发布（inProgress + userFraction）：
+                    #   · production 轨道 → 显示为「待发布」而非「审核中」。
+                    #     Google Play API 没有审核状态字段，inProgress 既可能是「审核中」，
+                    #     也可能是「审核通过后按比例灰度中」；我们用的比例是百万分之一，
+                    #     约等于没人收得到更新，语义上更接近「还没正式发布」，故归为待发布。
+                    #     （Google 后续若提供真实的待发布/拒绝字段，再改成准确归类。）
+                    #   · 其他轨道（beta/alpha/internal）保持「审核中」，不参与全量发布。
                     if track_name == "production":
-                        live_codes.extend(int(c) for c in codes)
-                        if name and name not in live_names:
-                            live_names.append(name)
+                        release_now = True
+                        review_msgs.append(f"{track_name}:分阶段发布中 ({nm})")
+                        if nm and nm not in pending_names:
+                            pending_names.append(nm)
+                    else:
+                        review_msgs.append(f"{track_name}:审核中 ({nm})")
+                        if nm and nm not in reviewing_names:
+                            reviewing_names.append(nm)
+                elif status == "draft":
+                    review_msgs.append(f"{track_name}:草稿未送审 ({nm})")
+                    if nm and nm not in draft_names:
+                        draft_names.append(nm)
+                elif status == "completed":
+                    if track_name == "production":
+                        prod_completed.append(
+                            {"name": nm, "codes": codes, "semver": _semver(name)}
+                        )
                     else:
                         # 内测/测试轨道单独收集
-                        if track_name == "beta" and name and name not in beta_names:
-                            beta_names.append(name)
-                        elif track_name == "alpha" and name and name not in alpha_names:
-                            alpha_names.append(name)
-                        elif track_name == "internal" and name and name not in internal_names:
-                            internal_names.append(name)
+                        if track_name == "beta" and nm and nm not in beta_names:
+                            beta_names.append(nm)
+                        elif track_name == "alpha" and nm and nm not in alpha_names:
+                            alpha_names.append(nm)
+                        elif track_name == "internal" and nm and nm not in internal_names:
+                            internal_names.append(nm)
                 elif status == "halted":
-                    review_msgs.append(f"{track_name}:已暂停 ({name})")
+                    review_msgs.append(f"{track_name}:已暂停 ({nm})")
 
-        if any_in_progress:
+        # API 的 status=completed 不代表审核通过/真正上架：审核被拒或尚未生效时，
+        # Play API 也可能返回 completed。商店页面显示的版本才是真正已上架版本，
+        # 因此用页面版本对 production 的 completed 发布做复核。
+        page_ver = ""
+        page_semver = None
+        # 只要有正式版发布（completed 或分阶段 inProgress），就用商店页面版本复核，
+        # 保证「已上架」始终显示真正在商店生效的版本。
+        if prod_completed or release_now:
+            page_ver = self._play_page_version(package_name)
+            page_semver = _semver(page_ver)
+
+        if page_ver:
+            for cand in prod_completed:
+                nm = cand["name"]
+                sv = cand["semver"]
+                if sv is not None and page_semver is not None and sv == page_semver:
+                    if nm and nm not in live_names:
+                        live_names.append(nm)
+                    for c in cand["codes"]:
+                        try:
+                            live_codes.append(int(c))
+                        except (TypeError, ValueError):
+                            pass
+                elif sv is not None and page_semver is not None and sv > page_semver:
+                    # 比页面版本新但还没在商店生效：按审核中展示
+                    review_msgs.append(f"production:审核中 ({nm})")
+                    if nm and nm not in reviewing_names:
+                        reviewing_names.append(nm)
+                # 比页面版本旧的 completed 属于已被替换的旧发布，不展示
+            if not live_names:
+                # 轨道里没有与页面版本一致的 completed（例如只有被拒的新版本），
+                # 页面版本才是真正已上架版本。
+                live_names = [page_ver]
+        else:
+            # 拿不到商店页面版本时退回旧逻辑：completed 一律按已上架处理。
+            for cand in prod_completed:
+                nm = cand["name"]
+                if nm and nm not in live_names:
+                    live_names.append(nm)
+                for c in cand["codes"]:
+                    try:
+                        live_codes.append(int(c))
+                    except (TypeError, ValueError):
+                        pass
+            if prod_completed:
+                audit_note = "未能核对商店页面版本，已上架按提交状态显示"
+
+        # 状态优先级：分阶段发布中（待发布）> 审核中 > 已上架 > 草稿 > 未知
+        if pending_names:
+            state = AuditState.PENDING
+        elif reviewing_names:
             state = AuditState.REVIEWING
-        elif any_completed:
+        elif live_names:
             state = AuditState.PUBLISHED
+        elif draft_names:
+            state = AuditState.DRAFT
         elif raw_tracks:
             state = AuditState.DRAFT
         else:
             state = AuditState.UNKNOWN
 
-        # Managed Publishing 模式：completed 版本可能是"待发布"或"已上架"。
-        # 用 Play 商店页面当前版本号自动判断：
-        #   页面版本 == API completed 版本 → 已真正上架（保持 PUBLISHED）
-        #   页面版本 < API completed 版本 → 审核通过待发布（PENDING）
-        if state == AuditState.PUBLISHED and self.credentials.get("managed_publishing"):
-            # API completed 版本取 live_names 中最大的语义版本号（多轨道/多版本时避免取到旧版）
-            api_semver = ""
-            _vers = []
-            for _nm in live_names:
-                _m = re.search(r"(\d+\.\d+\.\d+)", _nm)
-                if _m:
-                    _vers.append(tuple(int(x) for x in _m.group(1).split(".")))
-            if _vers:
-                api_semver = ".".join(str(x) for x in max(_vers))
-            page_ver = self._play_page_version(package_name)
-            if page_ver and api_semver and page_ver == api_semver:
-                # 页面版本与 API 版本一致 → 已发布到商店
-                pass  # 保持 PUBLISHED（已上架）
-            else:
-                # 页面版本更旧或获取不到 → 审核通过待发布
-                state = AuditState.PENDING
-                if live_names:
-                    # 版本号只进 audit_note（审核状态行展示），不进"审核中"列表：
-                    # 该版本已审核通过，语义是"待发布"而非"审核中"
-                    audit_note = "，".join(live_names) + " 审核通过，待发布（需在 Play Console 手动发布）"
-                    live_names = []
-                    live_codes = []
-                # 能拿到页面版本则显示为真实已上架版本
-                if page_ver:
-                    live_names = [page_ver]
-                    live_codes = []
+        # 分阶段发布中 → 「待发布」的说明文字：
+        # 原因见上面 inProgress 分支注释（API 无法区分审核中/灰度中，百万分之一≈未发布）。
+        # 版本号只进 audit_note（审核状态行展示），不进 reviewing_names，避免又显示成「审核中」。
+        if pending_names:
+            audit_note = "；".join(
+                f"{nm} 分阶段发布中（百万分之一，点「全量发布」正式上线）" for nm in pending_names
+            )
+
+        # 自管式发布（Managed Publishing）：审核通过后 Google 不会自动上架，需手动发布。
+        if self.credentials.get("managed_publishing") and (reviewing_names or pending_names):
+            audit_note = "自管式发布，审核通过后需在 Play Console 手动发布"
 
         extra = {}
         if beta_names:
@@ -479,11 +579,61 @@ class GoogleAdapter(StoreAdapter):
             draft_version_names=draft_names,
             reviewing_version_names=reviewing_names,
             audit_note=audit_note,
+            google_release_now=release_now,
             review_message="；".join(review_msgs) or ("各轨道当前无发布记录" if not raw_tracks else ""),
             checked_at=utcnow_iso(),
             raw=raw_tracks,
             **extra,
         )
+
+    def release_now(self, package_name: str) -> dict:
+        """分阶段发布的版本改为全量发布（userFraction 从百万分之一调到 100%）。
+
+        适用于「自动送审」时用 inProgress + 极低比例提交的版本：
+        审核通过后 Google 自动按极低比例上线，调此接口把比例改到 100% 全量发布。
+        """
+        service = self._service(package_name)
+        edit = service.edits().insert(body={}, packageName=package_name).execute()
+        edit_id = edit["id"]
+        try:
+            tracks = service.edits().tracks().list(
+                editId=edit_id, packageName=package_name
+            ).execute()
+            updated = False
+            for track in tracks.get("tracks", []):
+                # 只处理正式发布轨道，避免误把 beta/internal 的分阶段发布也转成全量
+                if track.get("track") != "production":
+                    continue
+                rels = track.get("releases", [])
+                changed = False
+                for rel in rels:
+                    if rel.get("status") == "inProgress":
+                        rel["status"] = "completed"
+                        rel.pop("userFraction", None)
+                        changed = True
+                if changed:
+                    service.edits().tracks().update(
+                        packageName=package_name, editId=edit_id,
+                        track=track["track"],
+                        body={"track": track["track"], "releases": rels},
+                    ).execute()
+                    updated = True
+            if not updated:
+                raise StoreError("没有处于分阶段发布（inProgress）的版本，无需全量发布")
+            service.edits().commit(
+                packageName=package_name, editId=edit_id
+            ).execute()
+            return {"message": "已全量发布（userFraction → 100%）"}
+        except StoreError:
+            raise
+        except Exception as e:
+            try:
+                service.edits().delete(
+                    packageName=package_name, editId=edit_id
+                ).execute()
+            except Exception:
+                pass
+            raise StoreError(f"Google 全量发布失败: {self._explain_error(e)}")
 
     # ---- 签名 APK 下载（generatedapks）----
 
@@ -577,15 +727,11 @@ class GoogleAdapter(StoreAdapter):
         out.sort(key=lambda x: -x["version_code"])
         return out
 
-    def download_signed_apk(self, package_name: str, version_code: int, dest_path: str) -> str:
-        """下载指定 Bundle 版本的签名 APK（universal 整包）到 dest_path。
+    def _universal_apk_download_id(self, package_name: str, version_code: int) -> str:
+        """查询该版本的 universal 整包 APK downloadId（generatedapks.list）。
 
-        generatedapks.list 拿 generatedUniversalApk 的 downloadId，
-        再 generatedapks.download_media 流式写盘（8MB 分块）。
-        下载的 APK 由 Play App Signing 的应用签名密钥签名，可直接覆盖安装做升级测试。
-        409 = 该 bundle 的 APK 还在生成中（刚上传），稍后重试即可。
+        409 = 该版本的 APK 还在生成中（刚上传），稍后重试即可。
         """
-        import googleapiclient.http
         from googleapiclient.errors import HttpError
 
         service = self._service(package_name)
@@ -603,15 +749,62 @@ class GoogleAdapter(StoreAdapter):
             raise StoreError(f"Google 拉取签名 APK 信息失败: {e}")
         except Exception as e:
             raise StoreError(f"Google 拉取签名 APK 信息失败: {e}")
-
-        download_id = ""
         for key in resp.get("generatedApks", []) or []:
             uni = key.get("generatedUniversalApk") or {}
             if uni.get("downloadId"):
-                download_id = uni["downloadId"]
-                break
-        if not download_id:
-            raise StoreError("该版本未生成 universal 整包 APK，无法下载（可重试或换版本）")
+                return uni["downloadId"]
+        raise StoreError("该版本未生成 universal 整包 APK，无法下载（可重试或换版本）")
+
+    def stream_signed_apk(self, package_name: str, version_code: int, part_path: str):
+        """流式拉取签名 APK（生成器）：先 yield 总字节数，再逐块 yield 数据。
+
+        总大小要等第一块数据到达才知道（yield 给调用方发 Content-Length 用，
+        浏览器下载条才能显示百分比）；数据块同时写入 part_path。
+        生成器自然结束 = 文件完整；中途异常/关闭由调用方负责清理 part 文件。
+        """
+        import googleapiclient.http
+
+        download_id = self._universal_apk_download_id(package_name, version_code)
+        service = self._service(package_name)
+        req = service.generatedapks().download_media(
+            packageName=package_name, versionCode=version_code, downloadId=download_id
+        )
+        with open(part_path, "wb") as fh:
+            captured = []
+
+            class _Capture:
+                """MediaIoBaseDownload 的写入目标：数据落盘同时暂存，供生成器逐块 yield。"""
+
+                def write(self, data):
+                    fh.write(data)
+                    captured.append(data)
+
+            downloader = googleapiclient.http.MediaIoBaseDownload(
+                _Capture(), req, chunksize=8 * 1024 * 1024
+            )
+            done = False
+            first = True
+            while not done:
+                del captured[:]
+                status, done = downloader.next_chunk()
+                if first:
+                    first = False
+                    yield int(status.total_size or 0)
+                if captured:
+                    yield b"".join(captured)
+
+    def download_signed_apk(self, package_name: str, version_code: int, dest_path: str) -> str:
+        """下载指定 Bundle 版本的签名 APK（universal 整包）到 dest_path。
+
+        generatedapks.list 拿 generatedUniversalApk 的 downloadId，
+        再 generatedapks.download_media 流式写盘（8MB 分块）。
+        下载的 APK 由 Play App Signing 的应用签名密钥签名，可直接覆盖安装做升级测试。
+        """
+        import googleapiclient.http
+        from googleapiclient.errors import HttpError
+
+        download_id = self._universal_apk_download_id(package_name, version_code)
+        service = self._service(package_name)
 
         dest = Path(dest_path)
         dest.parent.mkdir(parents=True, exist_ok=True)

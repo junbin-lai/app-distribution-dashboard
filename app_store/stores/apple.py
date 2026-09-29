@@ -50,6 +50,13 @@ _BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.
 # App Store Connect API 端点
 _ASC_BASE = "https://api.appstoreconnect.apple.com/v1"
 
+# apps.apple.com 页面版本解析缓存：看板/飞书反复查询时避免每次抓大页面。
+# key=package_name, value=(expire_monotonic, version)。失败结果也缓存（短 TTL），
+# 防止网络抖动时每次都等 30s 超时。
+_PAGE_VERSION_CACHE: Dict[str, tuple] = {}
+_PAGE_VERSION_TTL_SECONDS = 300
+_PAGE_VERSION_FAIL_TTL_SECONDS = 60
+
 
 class AppleAdapter(StoreAdapter):
     platform = Platform.APPLE
@@ -121,20 +128,36 @@ class AppleAdapter(StoreAdapter):
         m = re.search(r'"primarySubtitle":"版本\s*([0-9]+(?:\.[0-9]+){1,3})"', html)
         return m.group(1) if m else ""
 
+    def _page_version_cached(self, package_name: str, track_url: str) -> str:
+        """带缓存地抓 apps.apple.com 页面版本。
+
+        Lookup 的 CDN 缓存可能滞后，页面版本更准；但页面抓取较慢，按包名缓存，
+        成功 5 分钟、失败 1 分钟，避免看板/飞书反复查询时每次都等页面。
+        """
+        now = time.monotonic()
+        hit = _PAGE_VERSION_CACHE.get(package_name)
+        if hit is not None and hit[0] > now:
+            return hit[1]
+        value = ""
+        if track_url:
+            try:
+                html = self._http_get(track_url)
+                value = self._parse_page_version(html)
+            except Exception:
+                value = ""
+        ttl = _PAGE_VERSION_TTL_SECONDS if value else _PAGE_VERSION_FAIL_TTL_SECONDS
+        _PAGE_VERSION_CACHE[package_name] = (now + ttl, value)
+        return value
+
     def query_status(self, package_name: str) -> StoreStatus:
         r0 = self._lookup(package_name)
         version = ""
         page_used = False
         track_url = r0.get("trackViewUrl") or ""
-        if track_url:
-            try:
-                html = self._http_get(track_url)
-                v = self._parse_page_version(html)
-                if v:
-                    version = v
-                    page_used = True
-            except Exception:
-                pass
+        v = self._page_version_cached(package_name, track_url)
+        if v:
+            version = v
+            page_used = True
         if not version:
             version = r0.get("version") or ""
         state = AuditState.PUBLISHED if version else AuditState.UNKNOWN

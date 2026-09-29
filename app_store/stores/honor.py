@@ -217,28 +217,44 @@ class HonorAdapter(StoreAdapter):
         if scb: scb("上传 APK 到荣耀…")
         import requests as req
         tok = self._token(pkg)
-        try:
-            if pc:
-                f = open(apk, "rb")
+        # 上传自动重试：仅连接中断/超时重试（每次重新打开文件、从 0 重传，上传 URL 不变）；
+        # 拿到任何 HTTP 响应（成功或业务报错）都不重试，与应用宝 COS 直传的重连策略一致。
+        uploaded = False
+        last_err = None
+        for attempt in range(1, 4):
+            try:
+                if pc:
+                    f = open(apk, "rb")
+                    try:
+                        fields = [("file", (apk_name, f, "application/vnd.android.package-archive"))]
+                        body = make_multipart_monitor(fields, fs, pc)
+                        up_resp = req.post(upload_url, data=body,
+                                           headers={"Authorization": f"Bearer {tok}", "Content-Type": body.content_type}, timeout=600)
+                    finally:
+                        f.close()
+                else:
+                    with open(apk, "rb") as f:
+                        up_resp = req.post(upload_url, files={"file": (apk_name, f, "application/vnd.android.package-archive")},
+                                           headers={"Authorization": f"Bearer {tok}"}, timeout=600)
                 try:
-                    fields = [("file", (apk_name, f, "application/vnd.android.package-archive"))]
-                    body = make_multipart_monitor(fields, fs, pc)
-                    up_resp = req.post(upload_url, data=body,
-                                       headers={"Authorization": f"Bearer {tok}", "Content-Type": body.content_type}, timeout=600)
-                finally:
-                    f.close()
-            else:
-                with open(apk, "rb") as f:
-                    up_resp = req.post(upload_url, files={"file": (apk_name, f, "application/vnd.android.package-archive")},
-                                       headers={"Authorization": f"Bearer {tok}"}, timeout=600)
-        except (req.ConnectionError, req.Timeout) as e:
-            raise StoreError(f"荣耀文件上传网络错误: {e}")
-        try:
-            up_d = up_resp.json()
-        except Exception:
-            raise StoreError(f"荣耀文件上传返回非JSON (HTTP {up_resp.status_code}): {up_resp.text[:300]}")
-        if up_d.get("code") != 0:
-            raise StoreError(f"荣耀文件上传失败: {up_d.get('msg', up_d)}")
+                    up_d = up_resp.json()
+                except Exception:
+                    raise StoreError(f"荣耀文件上传返回非JSON (HTTP {up_resp.status_code}): {up_resp.text[:300]}")
+                if up_d.get("code") != 0:
+                    raise StoreError(f"荣耀文件上传失败: {up_d.get('msg', up_d)}")
+                uploaded = True
+                break
+            except StoreError:
+                raise  # HTTP 层/业务错误不重试，保持原有行为
+            except (req.ConnectionError, req.Timeout) as e:
+                last_err = e
+                if attempt < 3:
+                    if scb:
+                        scb(f"上传中断（{type(e).__name__}），{2 ** attempt} 秒后第 {attempt + 1} 次重试…")
+                    time.sleep(2 ** attempt)
+        if not uploaded:
+            raise StoreError(
+                f"荣耀文件上传失败（{attempt} 次尝试均连接中断，多为网络不稳）: {last_err}")
 
         # 3) 更新文件信息（bindingFileList 绑定 APK 到版本）
         if scb: scb("绑定 APK 文件…")

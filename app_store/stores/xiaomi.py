@@ -244,15 +244,48 @@ class XiaomiAdapter(StoreAdapter):
             QUERY_URL,
             data={"RequestData": json.dumps(request_data, ensure_ascii=False), "SIG": encrypted},
         )
-        # 小米返回：result=0 成功（文档明确的成功码），packageInfo 内含线上版本
+        # 小米 dev/query 返回 packageInfo：versionName/versionCode 是「最新（提审）版本」，
+        # onlineVersionCode 是「线上版本号」（商店已上架）。接口没有审核状态字段。
         ok = payload.get("result") in (0, "0")
         info = payload.get("packageInfo") or {}
         version = info.get("versionName") or ""
-        vcode = info.get("onlineVersionCode") or info.get("versionCode")
-        names = [str(version)] if version else []
-        codes = [int(vcode)] if vcode not in (None, "", 0) else []
-        state = AuditState.PUBLISHED if version else AuditState.UNKNOWN
-        # 小米 dev/query 无审核状态字段；"查询成功"等操作信息不写入状态
+        submitted_code = info.get("versionCode")
+        online_code = info.get("onlineVersionCode")
+
+        def _as_int(v):
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return None
+
+        submitted = _as_int(submitted_code)
+        online = _as_int(online_code)
+
+        # 小米没有审核状态/拒绝字段，只能按版本号大小推断：
+        #   线上版本号 < 最新版本号  → 提审版本还没上线 → 审核中
+        #   线上版本号 == 最新版本号 → 已上架
+        # 这是近似处理：被拒时接口也不会告诉我们（仍会显示成「审核中」），
+        # 等小米后续开放审核状态/拒绝字段后再改成准确归类。
+        reviewing_names: List[str] = []
+        live_names: List[str] = []
+        live_codes: List[int] = []
+        audit_note = ""
+        if submitted is not None and online is not None and submitted > online:
+            state = AuditState.REVIEWING
+            if version:
+                reviewing_names = [str(version)]
+            audit_note = f"{version} 审核中" if version else "审核中"
+            # 接口不返回线上版本名，只有线上版本号，补进备注便于确认商店当前还是哪个版本
+            audit_note += f"（线上版本号 {online}）"
+        elif version:
+            state = AuditState.PUBLISHED
+            live_names = [str(version)]
+            code = online if online is not None else submitted
+            if code is not None:
+                live_codes = [code]
+        else:
+            state = AuditState.UNKNOWN
+        # "查询成功"等操作信息不写入状态
         msg = payload.get("message") or ""
         if msg in ("查询成功", "成功", ""):
             msg = ""
@@ -260,8 +293,10 @@ class XiaomiAdapter(StoreAdapter):
             platform=self.platform,
             package_name=package_name,
             state=state,
-            live_version_codes=codes,
-            live_version_names=names,
+            live_version_codes=live_codes,
+            live_version_names=live_names,
+            reviewing_version_names=reviewing_names,
+            audit_note=audit_note,
             review_message=msg,
             raw=payload,
             checked_at=utcnow_iso(),

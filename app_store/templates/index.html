@@ -154,12 +154,11 @@ function api(p,o){return fetch(p,o).then(function(r){if(r.status===401)showLogin
 // ==== 登录/会话（board.json 配置 users 后开启；viewer 只读，admin 可发布） ====
 function showLogin(){if(document.getElementById("loginOverlay"))return;
 var h='<div class="overlay" id="loginOverlay"><div class="modal" style="text-align:center;--modal-min-w:360px">'
-+'<h3 class="section-title" style="margin-bottom:var(--space-3)">登录看板</h3>'
++'<h3 class="section-title" style="margin-bottom:var(--space-3)">App发布看板</h3>'
 +'<div style="text-align:left"><label for="lgUser">用户名</label><input id="lgUser" autocomplete="username"></div>'
 +'<div style="text-align:left;margin-top:var(--space-2)"><label for="lgPass">密码</label><input id="lgPass" type="password" autocomplete="current-password"></div>'
 +'<div id="lgErr" style="color:var(--err);font-size:var(--font-caption);min-height:18px;margin-top:var(--space-2)"></div>'
 +'<button id="lgBtn" onclick="doLogin()" style="width:100%">登 录</button>'
-+'<div class="muted" style="margin-top:var(--space-2)">账号在 config/board.json 里配置（admin 可发布，viewer 只读）</div></div></div>';
 var d=document.createElement("div");d.innerHTML=h;document.body.appendChild(d.firstElementChild);
 var u=$("lgUser"),pw=$("lgPass");
 [u,pw].forEach(function(el){el.addEventListener("keydown",function(e){if(e.key==="Enter")doLogin()})});
@@ -202,7 +201,7 @@ h+='<div class=card><h3>发布</h3>'+
 '<div><label for="ipvn">版本名</label><input id="ipvn" readonly value=""></div>'+
 '<div><label for="ipvc">versionCode</label><input id="ipvc" readonly value=""></div>'+
 '<div><label>发布平台（可多选）</label><div id="ipp" style="display:flex;flex-wrap:wrap;gap:var(--space-2)">'+publishPlatsHTML()+'</div><div style="margin-top:var(--space-2)"><button type=button class=sm secondary onclick=platAll(1)>全选</button> <button type=button class=sm secondary onclick=platAll(0)>清空</button></div></div>'+
-'<div><label for="ipv">轨道（Google）</label><select id="ipv"><option>production</option><option>beta</option><option>alpha</option><option>internal</option></select></div>'+
+'<div><label for="ipv">轨道（Google）</label><select id="ipv"><option>production</option><option>beta</option><option>alpha</option><option>internal</option></select></div>'+'<div><label for="iprm">Google 发布方式</label><select id="iprm"><option value="staged" selected>分阶段发布（审核通过后先放百万分之一，再手动全量）</option><option value="full">全量发布（审核通过后自动 100% 上线）</option></select></div>'+
 '<div><label for="ipn">更新说明</label><textarea id="ipn" rows="2"></textarea><div class="form-group"><label for="pot">定时上线（留空=立即）</label><input id="pot" type="datetime-local"></div></div>'+
 '<div class=check><input type=checkbox id=ipdry checked><label for=ipdry>仅校验（不送审）</label> <input type="checkbox" id="ipauto" checked style="margin-left:var(--space-3)"><label for=ipauto>Google 自动送审</label></div>'+
 '<div class=actions>'+(a.query_only?'<button class=secondary disabled title="仅查询应用不支持发布">发布于 AGC 控制台</button>':(admin?'<button onclick=dpub()>发布</button>':'<button disabled title="只读账号（viewer）不可发布，需 admin 登录">发布（只读账号不可用）</button>'))+'</div></div>'+
@@ -253,7 +252,7 @@ var rows=document.querySelectorAll('#appc .card .row');rows.forEach(function(ro)
 })}
 function dpub(){var a=ST.cur;if(!a||!a.package_name){toast("请选择应用（需配包名）","err");return}
 var ab_in=$("paab").value.trim(),ap_in=$("papk").value.trim();
-var body={app_id:a.id,platform:selPlats(),dry_run:$("ipdry").checked,auto_review:$("ipauto").checked,version_name:$("ipvn").value.trim(),version_code:parseInt($("ipvc").value)||null,release_notes:$("ipn").value.trim(),track:$("ipv").value,aab_path:(ab_in||a.aab_build||""),apk_path:(ap_in||a.apk_build||""),online_time:document.getElementById("pot")?document.getElementById("pot").value.trim():""};
+var body={app_id:a.id,platform:selPlats(),dry_run:$("ipdry").checked,auto_review:$("ipauto").checked,release_mode:$("iprm").value,version_name:$("ipvn").value.trim(),version_code:parseInt($("ipvc").value)||null,release_notes:$("ipn").value.trim(),track:$("ipv").value,aab_path:(ab_in||a.aab_build||""),apk_path:(ap_in||a.apk_build||""),online_time:document.getElementById("pot")?document.getElementById("pot").value.trim():""};
 lg("== "+(body.dry_run?"Dry-run":"正式")+"发布 "+(a.name||a.id)+" ==");busy(true);api("/api/publish",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){if(r.task_id){lg("任务: "+r.task_id);startPoll(r.task_id)}else{lg("启动失败: "+JSON.stringify(r),"err");busy(false)}})}
 function renderTask(t){ST.LASTT=t;
 var stopBtn=$("tstop");if(stopBtn)stopBtn.style.display=((t.status==="running")&&isAdmin())?"":"none";
@@ -332,22 +331,26 @@ function confirmStopTask(){var h='<div class="overlay" onclick="if(event.target=
 function stopTask(){clh();var tid=ST.POLL;if(!tid){toast("当前没有进行中的任务","err");return}
 lg("== 停止发布任务 ==");api("/api/tasks/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({task_id:tid})}).then(function(r){if(r&&r.ok){lg("已请求停止，正在中断各平台…","ok")}else{lg("停止失败: "+((r&&r.error)||"未知错误"),"err")}}).catch(function(){lg("停止请求发送失败","err")})}
 function ds(){var a=ST.cur;if(!a||!a.package_name){toast("请选择应用","err");return}
-lg("== 查询状态 "+a.name+" ==");busy(true);var _sb=$("shareBtn");if(_sb)_sb.classList.add("hide");var _ss=$("sgSection");if(_ss)_ss.style.display="";$("sg").innerHTML="<div class=muted>查询中…</div>";api("/api/status",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({app_id:a.id,platform:statusSelPlats()})}).then(function(r){renderStatusGrid(r.statuses||[]);busy(false)}).catch(function(){ $("sg").innerHTML='<div class=muted>查询失败</div>';busy(false)})}
-function confirmReleaseNow(){var h='<div class="overlay" onclick="if(event.target===this)clh()"><div class="modal" style="text-align:center;--modal-min-w:340px"><p style="margin:var(--space-2) 0 var(--space-3);font-size:var(--font-title);font-weight:600">华为立即上线</p><p style="color:var(--mut);font-size:var(--font-body);margin-bottom:var(--space-5)">将审核通过的定时上架版本改为<b>立即上架</b>（原定时时间作废）。确认执行？</p><div style="display:flex;gap:var(--space-2);justify-content:center"><button onclick=doReleaseNow() style="background:var(--acc)">确认执行</button><button class=secondary onclick=clh()>取消</button></div></div></div>';var d=document.createElement("div");d.innerHTML=h;document.body.appendChild(d.firstElementChild)}
-function doReleaseNow(){clh();var a=ST.cur;if(!a||!a.package_name){toast("请选择应用","err");return}
-lg("== 华为立即上线 "+a.name+" ==");busy(true);
-api("/api/release-now",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({app_id:a.id,platform:"huawei"})}).then(function(r){busy(false);if(r&&r.ok){lg("华为立即上线请求成功"+(r.result&&r.result.message?"："+r.result.message:""),"ok");ds()}else{lg("立即上线失败: "+((r&&r.error)||"未知错误"),"err")}}).catch(function(){busy(false);lg("立即上线请求失败","err")})}
-function renderStatusGrid(s){var e=document.getElementById("sg");if(!e)return;var sb=document.getElementById("shareBtn");if(!s||!s.length){ST.statuses=null;if(sb)sb.classList.add("hide");e.innerHTML='<div class=muted>无数据</div>';return}
+lg("== 查询状态 "+a.name+" ==");busy(true);var _sb=$("shareBtn");if(_sb)_sb.classList.add("hide");var _ss=$("sgSection");if(_ss)_ss.style.display="";$("sg").innerHTML="<div class=muted>查询中…</div>";api("/api/status",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({app_id:a.id,platform:statusSelPlats()})}).then(function(r){renderStatusGrid(r.statuses||[],r.errors||[]);busy(false)}).catch(function(){ $("sg").innerHTML='<div class=muted>查询失败</div>';busy(false)})}
+function confirmReleaseNow(platform){platform=platform||"huawei";var titles={huawei:"华为立即上线",google:"Google 全量发布"};var descs={huawei:"将审核通过的定时上架版本改为<b>立即上架</b>（原定时时间作废）。确认执行？",google:"将分阶段发布（百万分之一比例）的版本改为<b>100% 全量发布</b>。确认执行？"};var h='<div class="overlay" onclick="if(event.target===this)clh()"><div class="modal" style="text-align:center;--modal-min-w:340px"><p style="margin:var(--space-2) 0 var(--space-3);font-size:var(--font-title);font-weight:600">'+titles[platform]+'</p><p style="color:var(--mut);font-size:var(--font-body);margin-bottom:var(--space-5)">'+descs[platform]+'</p><div style="display:flex;gap:var(--space-2);justify-content:center"><button onclick=doReleaseNow("'+platform+'") style="background:var(--acc)">确认执行</button><button class=secondary onclick=clh()>取消</button></div></div></div>';var d=document.createElement("div");d.innerHTML=h;document.body.appendChild(d.firstElementChild)}
+function doReleaseNow(platform){clh();var a=ST.cur;if(!a||!a.package_name){toast("请选择应用","err");return}
+lg("== "+(platform==="google"?"Google 全量发布":"华为立即上线")+" "+a.name+" ==");busy(true);
+api("/api/release-now",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({app_id:a.id,platform:platform})}).then(function(r){busy(false);if(r&&r.ok){lg((platform==="google"?"Google 全量发布":"华为立即上线")+"请求成功"+(r.result&&r.result.message?"："+r.result.message:""),"ok");ds()}else{lg((platform==="google"?"全量发布":"立即上线")+"失败: "+((r&&r.error)||"未知错误"),"err")}}).catch(function(){busy(false);lg((platform==="google"?"全量发布":"立即上线")+"请求失败","err")})}
+function renderStatusGrid(s,errs){var e=document.getElementById("sg");if(!e)return;var sb=document.getElementById("shareBtn");errs=errs||[];
 var order={huawei:0,oppo:1,vivo:2,xiaomi:3,honor:4,google:5,apple:6,qq:7}
 var nm={huawei:"华为",oppo:"OPPO",vivo:"VIVO",xiaomi:"小米",honor:"荣耀",google:"Google Play",apple:"Apple",qq:"应用宝"}
-var list=(s||[]).slice().sort(function(a,b){return (order[a.platform]!==undefined?order[a.platform]:99)-(order[b.platform]!==undefined?order[b.platform]:99)});ST.statuses=list;if(sb)sb.classList.remove("hide");
-var h="";list.forEach(function(x){
+var list=(s||[]).slice().sort(function(a,b){return (order[a.platform]!==undefined?order[a.platform]:99)-(order[b.platform]!==undefined?order[b.platform]:99)});var gridList=list.slice();
+(errs||[]).forEach(function(x){gridList.push({platform:x.platform,_isErr:true,_err:(x.error||"未知错误")})});
+if(!gridList.length){ST.statuses=null;if(sb)sb.classList.add("hide");e.innerHTML='<div class=muted>无数据</div>';return}
+gridList.sort(function(a,b){return (order[a.platform]!==undefined?order[a.platform]:99)-(order[b.platform]!==undefined?order[b.platform]:99)});ST.statuses=list;if(list.length&&sb)sb.classList.remove("hide");
+var h="";gridList.forEach(function(x){
+if(x._isErr){h+='<div class="card"><div class="section-head"><b style="font-size:var(--font-caption)">'+esc(nm[x.platform]||x.platform)+'</b><span class="state rejected">查询失败</span></div>'+row("错误信息",'<span style="color:var(--err)">'+esc(x._err)+'</span>')+'</div>';return}
 var liveArr=(x.live_version_names||[]).slice();if(!liveArr.length&&x.live_version_codes)liveArr=x.live_version_codes.map(String);
 var live=liveArr.length?liveArr.join("<br>"):"-";
 var rev=(x.reviewing_version_names||[]).join(", ");var draft=(x.draft_version_names||[]).join(", ");var beta=(x.beta_version_names||[]).join(", ");var alpha=(x.alpha_version_names||[]).join(", ");var inter=(x.internal_version_names||[]).join(", ");var tst=[];if(beta)tst.push("Beta:"+beta);if(alpha)tst.push("Alpha:"+alpha);if(inter)tst.push("内测:"+inter);var tstRow=tst.join(" ；");
 var note=(x.audit_note||"").trim();
 var revText=note?esc(note):(rev?esc(rev):(x.state==="reviewing"?"审核中":"-"));
-h+='<div class="card"><div class="section-head"><b style="font-size:var(--font-caption)">'+esc(nm[x.platform]||x.platform)+'</b><span style="display:flex;gap:var(--space-2);align-items:center">'+((x.platform==="huawei"&&x.state==="pending"&&isAdmin())?'<button class=mini-btn onclick="confirmReleaseNow()">立即上线</button>':"")+'<span class="state '+x.state+'">'+stat(x.state)+'</span></span></div>'+row("已上架版本",'<span class=v style="white-space:pre-line">'+live+'</span>')+row("审核状态",revText)+row("草稿未送审",draft?esc(draft):"-")+(tstRow?row("内测版本",esc(tstRow)):"")+'</div>'});
+h+='<div class="card"><div class="section-head"><b style="font-size:var(--font-caption)">'+esc(nm[x.platform]||x.platform)+'</b><span style="display:flex;gap:var(--space-2);align-items:center">'+((x.platform==="huawei"&&x.state==="pending"&&isAdmin())?'<button class=mini-btn onclick="confirmReleaseNow(\'huawei\')">立即上线</button>':"")+((x.platform==="google"&&(x.state==="published"||x.google_release_now)&&isAdmin())?'<button class=mini-btn onclick="confirmReleaseNow(\'google\')">全量发布</button>':"")+'<span class="state '+x.state+'">'+stat(x.state)+'</span></span></div>'+row("已上架版本",'<span class=v style="white-space:pre-line">'+live+'</span>')+row("审核状态",revText)+row("草稿未送审",draft?esc(draft):"-")+(tstRow?row("内测版本",esc(tstRow)):"")+'</div>'});
 e.innerHTML=h}
 function shareStatus(){
 var list=ST.statuses||[],a=ST.cur;
@@ -465,7 +468,7 @@ function renderGSel(){var e=$("gsel");if(!e)return;var s=ST.GBSEL;if(!s){e.inner
 e.innerHTML='<div class=row><span class=k>版本</span><span class=v>'+esc(s.version_name||"—")+'（versionCode '+s.version_code+'）</span></div>'
 +'<div class=row><span class=k>发布状态</span><span class=v>'+esc(s.release_status||"—")+'</span></div>'
 +'<div style="margin-top:var(--space-2)"><button onclick="dapk()">下载签名 APK</button><span class="muted" style="font-size:var(--font-caption);margin-left:var(--space-2)">下载由浏览器接管</span></div>'}
-function dapk(){var a=ST.cur,s=ST.GBSEL;if(!a||!s)return;lg("== 从 Google Play 下载签名 APK: "+(s.version_name||s.version_code)+"（versionCode "+s.version_code+"） ==");var u="/api/google/apk?app_id="+encodeURIComponent(a.id)+"&version_code="+encodeURIComponent(s.version_code);var l=document.createElement('a');l.href=u;l.target="_blank";document.body.appendChild(l);l.click();l.remove();toast("已开始下载（由浏览器接管，进度看浏览器下载列表）");lg("已交给浏览器下载：该版本首次下载需先从 Google 拉取（1-2 分钟）后自动开始","ok")}
+function dapk(){var a=ST.cur,s=ST.GBSEL;if(!a||!s)return;lg("== 从 Google Play 下载签名 APK: "+(s.version_name||s.version_code)+"（versionCode "+s.version_code+"） ==");var u="/api/google/apk?app_id="+encodeURIComponent(a.id)+"&version_code="+encodeURIComponent(s.version_code);var l=document.createElement('a');l.href=u;l.target="_blank";document.body.appendChild(l);l.click();l.remove();toast("已开始下载（由浏览器接管，进度看浏览器下载列表）");lg("已交给浏览器下载：该版本首次下载为实时从 Google 拉取（速度取决于 VPN），完成后自动缓存、下次秒下","ok")}
 function validateAll(){lg("== 校验凭证 ==");api("/api/validate").then(function(r){(r.validated||[]).forEach(function(x){lg("["+x.platform+"] "+(x.ok?"OK":"ERROR")+(x.message?" "+x.message:""),x.ok?"ok":"err")})})}
 document.addEventListener("keydown",function(e){if(e.key!=="Enter"&&e.key!==" ")return;var t=e.target;if(!t||!t.classList)return;if(t.classList.contains("app-item")){e.preventDefault();sa(t.dataset.id)}else if(t.classList.contains("file-item")){e.preventDefault();pick(t)}else if(t.classList.contains("platform-chip")){e.preventDefault();selTPlat(t.dataset.plat)}});
 ld();

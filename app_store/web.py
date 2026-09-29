@@ -425,6 +425,7 @@ def _publish_worker(tid: str):
             online_time=params.get("online_time"),
         )
         release.metadata["auto_review"] = bool(params.get("auto_review"))
+        release.metadata["release_mode"] = params.get("release_mode") or "staged"
         _step(tid, f"包名: {release.package_name} v{release.version_name or '?'}")
         if release.version_name:
             _update(tid, version_name=release.version_name)  # 实际发布的版本号（含 catalog 回落）
@@ -640,6 +641,18 @@ def _same_origin(handler: BaseHTTPRequestHandler) -> bool:
 
 # ---- 状态查询 / 图标解析（HTTP 接口与飞书机器人共用）----
 
+def _is_transient_query_error(msg: str) -> bool:
+    """判断查询报错是否是网络类瞬时错误（并发查询时偶发 HTTPSConnectionPool 连接失败）。
+
+    只有这类错误才重试一次；凭证缺失/包名不存在等业务错误不重试。
+    """
+    m = msg or ""
+    for kw in ("网络", "连接", "超时", "Connection", "Timeout", "DNS", "timed out", "resolve"):
+        if kw in m:
+            return True
+    return False
+
+
 def query_app_status(app_id: str, platform: str = "all") -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """查询某应用在各平台的状态（/api/status 与飞书机器人共用这套实现）。
 
@@ -659,31 +672,70 @@ def query_app_status(app_id: str, platform: str = "all") -> Tuple[List[Dict[str,
 
     huawei_harmony_pkg = app.get("huawei_harmony_package") or ""
 
+    def query_one(key: str) -> Dict[str, Any]:
+        # 网络类瞬时错误重试一次（并发查询时偶发连接失败，重试后大多能恢复）；
+        # 凭证/包名等业务错误直接抛出，不重试。
+        last_err: Exception = StoreError(f"查询 {key} 失败")
+        for attempt in (1, 2):
+            try:
+                adapter = get_adapter(key, creds)
+                if key == "huawei" and huawei_harmony_pkg:
+                    s = adapter.query_status(package, huawei_harmony_pkg)
+                else:
+                    s = adapter.query_status(package)
+                return {
+                    "platform": key, "state": s.state.value,
+                    "live_version_codes": s.live_version_codes,
+                    "live_version_names": s.live_version_names,
+                    "draft_version_names": s.draft_version_names,
+                    "reviewing_version_names": s.reviewing_version_names,
+                    "beta_version_names": list(getattr(s, "beta_version_names", [])),
+                    "alpha_version_names": list(getattr(s, "alpha_version_names", [])),
+                    "internal_version_names": list(getattr(s, "internal_version_names", [])),
+                    "audit_note": s.audit_note,
+                    "google_release_now": bool(getattr(s, "google_release_now", False)),
+                    "review_message": s.review_message,
+                    "checked_at": s.checked_at,
+                }
+            except StoreError as e:
+                last_err = e
+                if attempt == 1 and _is_transient_query_error(str(e)):
+                    time.sleep(0.5)
+                    continue
+                raise
+            except Exception as e:
+                last_err = e
+                if attempt == 1 and _is_transient_query_error(str(e)):
+                    time.sleep(0.5)
+                    continue
+                raise
+        raise last_err
+
     statuses, errors = [], []
-    for key in targets:
-        try:
-            adapter = get_adapter(key, creds)
-            if key == "huawei" and huawei_harmony_pkg:
-                s = adapter.query_status(package, huawei_harmony_pkg)
-            else:
-                s = adapter.query_status(package)
-            statuses.append({
-                "platform": key, "state": s.state.value,
-                "live_version_codes": s.live_version_codes,
-                "live_version_names": s.live_version_names,
-                "draft_version_names": s.draft_version_names,
-                "reviewing_version_names": s.reviewing_version_names,
-                "beta_version_names": list(getattr(s, "beta_version_names", [])),
-                "alpha_version_names": list(getattr(s, "alpha_version_names", [])),
-                "internal_version_names": list(getattr(s, "internal_version_names", [])),
-                "audit_note": s.audit_note,
-                "review_message": s.review_message,
-                "checked_at": s.checked_at,
-            })
-        except StoreError as e:
-            errors.append({"platform": key, "error": str(e)})
-        except Exception as e:  # 单平台未预期异常不丢已查到的其他平台结果
-            errors.append({"platform": key, "error": f"异常: {e}"})
+    # 多个平台并发查询：各平台接口互相独立，串行时总耗时等于各平台之和。
+    # 并发上限压到 4，避免一次 8 个连接把网络压出 HTTPSConnectionPool 连接失败
+    # （实测全并发时 OPPO/华为/vivo/荣耀偶发连接错误导致漏平台）。
+    if len(targets) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        workers = min(len(targets), 4)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(query_one, key): key for key in targets}
+            for fut in futures:
+                key = futures[fut]
+                try:
+                    statuses.append(fut.result())
+                except StoreError as e:
+                    errors.append({"platform": key, "error": str(e)})
+                except Exception as e:  # 单平台未预期异常不丢已查到的其他平台结果
+                    errors.append({"platform": key, "error": f"异常: {e}"})
+    else:
+        for key in targets:
+            try:
+                statuses.append(query_one(key))
+            except StoreError as e:
+                errors.append({"platform": key, "error": str(e)})
+            except Exception as e:
+                errors.append({"platform": key, "error": f"异常: {e}"})
     return statuses, errors
 
 
@@ -1010,7 +1062,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/tasks/stop":
                 return self._api_tasks_stop(body)
             if path == "/api/tasks/clear":
-                return self._api_tasks_clear()
+                return self._api_tasks_clear(body)
             return _json_response(self, {"error": "not found"}, 404)
         except StoreError as e:
             return _json_response(self, {"ok": False, "error": str(e)}, 400)
@@ -1193,7 +1245,9 @@ class Handler(BaseHTTPRequestHandler):
         package = app.get("package_name") or ""
         if not package:
             raise StoreError(f"应用 {app_id} 尚未配置 package_name")
-        platform = (body.get("platform") or "huawei").lower()
+        platform = (body.get("platform") or "").lower()
+        if not platform:
+            raise StoreError("缺少 platform（如 huawei / google）")
         creds = load_credentials(self.credentials_path)
         if platform not in creds:
             raise StoreError(f"未配置 {platform} 凭证")
@@ -1307,8 +1361,8 @@ class Handler(BaseHTTPRequestHandler):
     def _api_google_apk(self):
         """下载指定 Bundle 版本的签名 APK（universal 整包，Play App Signing 密钥签名）。
 
-        服务端先从 Google 拉全量写入 downloads/{包名}-{versionCode}.apk（已缓存则直接用），
-        再带 Content-Length 流式回给浏览器——前端可显示下载进度。
+        已缓存（downloads/{包名}-{versionCode}.apk）直接从本地发；未缓存则流式透传：
+        边从 Google 拉边转发给浏览器（下载条立即出现并显示进度），完成后落盘缓存。
         """
         qs = parse_qs(urlparse(self.path).query)
         app_id = (qs.get("app_id") or [""])[0].strip()
@@ -1331,7 +1385,39 @@ class Handler(BaseHTTPRequestHandler):
             if not creds.get("google"):
                 raise StoreError("未配置 Google 凭证（credentials.json google 段）")
             adapter = get_adapter("google", creds)
-            adapter.download_signed_apk(package, version_code, dest)
+            # 首次拉取：流式透传给浏览器——先从 Google 读到第一块拿到总大小再发响应头，
+            # 浏览器下载条立即出现（有总大小即显示百分比进度），之后边从 Google 拉边转发；
+            # 同时写独立命名的 .part 临时文件（并发拉取互不干扰），全部完成后原子改名入缓存，
+            # 下载中断不会留下半成品被后续请求命中
+            part = dest + ".part-" + uuid.uuid4().hex[:8]
+            stream = None
+            try:
+                stream = adapter.stream_signed_apk(package, version_code, part)
+                total = next(stream)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/vnd.android.package-archive")
+                if total:
+                    self.send_header("Content-Length", str(total))
+                self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                try:
+                    for chunk in stream:
+                        self.wfile.write(chunk)
+                except (ConnectionError, BrokenPipeError):
+                    # 浏览器取消/断开：正常现象，停止拉取（finally 清理临时文件）
+                    return
+                os.replace(part, dest)
+                self._remember_google_version_name(package, version_code, dest)
+                return
+            finally:
+                if stream is not None:
+                    stream.close()
+                if os.path.isfile(part):
+                    try:
+                        os.remove(part)
+                    except OSError:
+                        pass
         # 顺带把该版本的真实 versionName 解析进本地缓存（版本列表显示用）
         self._remember_google_version_name(package, version_code, dest)
         size = os.path.getsize(dest)
@@ -1364,17 +1450,36 @@ class Handler(BaseHTTPRequestHandler):
         _step(tid, "收到停止请求，正在中断各平台上传…")
         return _json_response(self, {"ok": True})
 
-    def _api_tasks_clear(self):
+    def _api_tasks_clear(self, body: Dict[str, Any]):
         """清空发布历史：删除落盘文件 + 清理内存中的稳定任务。
 
-        清空前先把当前历史备份成 tasks_history.json.bak（只保留最近一份），
-        误点「清空」后可从备份找回。
+        两道防护（2026-09-23 起）：
+        1. 必须显式传 {"confirm": true} 才执行——防止随手/脚本误调（前端没有清空按钮，
+           这个接口只给脚本用，多一步确认不影响日常使用）
+        2. 清空前自动备份：tasks_history.json.bak（最近一次）+ 带时间戳的
+           tasks_history.json.bak-YYYYmmdd-HHMMSS（保留最近 5 份，多次清空也不会
+           把上一次的备份覆盖掉），随时可找回。
         """
-        # 先备份再删除（防误清不可恢复）
+        # 第一道闸：必须显式确认（{"confirm": true}），防止随手调用误清历史
+        if not (isinstance(body, dict) and body.get("confirm")):
+            raise StoreError(
+                "清空发布历史需要显式确认：请求体传 {\"confirm\": true}；"
+                "执行前会自动备份到 config/tasks_history.json.bak-<时间戳>")
+        # 第二道闸：先备份再删除（防误清不可恢复）
         try:
             if os.path.isfile(_HISTORY_FILE):
+                import glob
                 import shutil
                 shutil.copyfile(_HISTORY_FILE, _HISTORY_FILE + ".bak")
+                stamp = time.strftime("%Y%m%d-%H%M%S")
+                shutil.copyfile(_HISTORY_FILE, f"{_HISTORY_FILE}.bak-{stamp}")
+                # 只保留最近 5 份时间戳备份（只清理 .bak-<数字> 形式，不动手工备份）
+                olds = sorted(glob.glob(_HISTORY_FILE + ".bak-[0-9]*"))
+                for p in olds[:-5]:
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
         except Exception:
             pass
         # 删除落盘历史文件
@@ -1421,6 +1526,7 @@ class Handler(BaseHTTPRequestHandler):
         aab_path = body.get("aab_path") or ""
         online_time = body.get("online_time") or None
         auto_review = bool(body.get("auto_review"))
+        release_mode = body.get("release_mode") or "staged"
 
         # 前置校验：APK/AAB 包名必须与应用目录中的 package_name 一致
         for label, p in (("AAB", aab_path), ("APK", apk_path)):
@@ -1447,11 +1553,13 @@ class Handler(BaseHTTPRequestHandler):
             # auto_review 同时存进任务本身：任务结束时 _PENDING_PATHS 会被清掉，
             # 飞书通知要靠它判断 Google 是否真的送审（勾了自动送审才算送审成功）
             _TASKS[tid]["auto_review"] = auto_review
+            _TASKS[tid]["release_mode"] = release_mode
             _PENDING_PATHS[tid].update({
                 "version_name": version_name, "version_code": version_code,
                 "release_notes": release_notes, "track": track,
                 "online_time": online_time,
                 "auto_review": auto_review,
+                "release_mode": release_mode,
             })
         _step(tid, "任务已创建，后台发布中...")
 
