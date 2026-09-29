@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -48,6 +49,9 @@ PLATFORM_NAMES = {
 }
 
 STATE_LABELS = {k: v[0] for k, v in BADGES.items()}
+
+# 版本号样式（6.19.2 / 2.1.0），用于判断审核备注是否只是重复上面已列的版本
+_VERSION_RE = re.compile(r"\d+(?:\.\d+)+")
 
 # 中文字体探测链（Hiragino 索引来自实测：0=常规 2=粗体）
 _FONT_CANDIDATES = [
@@ -129,7 +133,13 @@ def _build_rows(statuses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if draft:
             lines.append(("草稿", draft))
         if note and note != STATE_LABELS.get(state):
-            lines.append(("", note))
+            # 备注里提到的版本号若已在上面几行列过（如华为备注「6.19.2 审核中（Android）」
+            # 与「审核中 6.19.2（Android）」重复），就不再重复显示；
+            # 而「production:审核通过，待上架」这类不带版本号的备注属于额外信息，保留
+            note_versions = set(_VERSION_RE.findall(note))
+            shown = " ".join(v for _, v in lines)
+            if not note_versions or not all(v in shown for v in note_versions):
+                lines.append(("", note))
         if not lines:
             lines.append(("", "—"))
         rows.append({

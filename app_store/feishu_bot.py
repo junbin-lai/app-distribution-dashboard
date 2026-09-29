@@ -237,20 +237,22 @@ def _at_prefix(at_user_id: str) -> str:
 
 
 def build_result_post(app_name: str, image_key: str, at_user_id: str = "") -> Dict[str, Any]:
-    """查询结果的富文本（post）消息：同一条里 @回提问的人 + 状态分享图。
+    """查询结果的富文本（post）消息：标题下方 @回提问的人 + 状态分享图。
 
     飞书的图片消息（msg_type=image）本身不能带 @，所以结果改用富文本发，
     这样「被@的人收到提醒」和「看到状态图」在同一气泡里。
+    富文本的 title 只能放纯文本（放不了可点击的 @），因此 @ 放在标题正下方的
+    第一行（紧跟标题、视觉上属于标题区），正文不再重复应用名那句文案。
     """
-    line: List[Dict[str, Any]] = []
     uid = str(at_user_id or "").strip()
+    content: List[List[Dict[str, Any]]] = []
     if uid:
-        line.append({"tag": "at", "user_id": uid})
-    line.append({"tag": "text", "text": f" {app_name} 各平台状态："})
+        content.append([{"tag": "at", "user_id": uid}])  # 标题下方 @提问者
+    content.append([{"tag": "img", "image_key": image_key}])
     return {
         "zh_cn": {
             "title": f"{app_name} 发布状态",
-            "content": [line, [{"tag": "img", "image_key": image_key}]],
+            "content": content,
         }
     }
 
