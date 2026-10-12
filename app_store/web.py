@@ -426,6 +426,7 @@ def _publish_worker(tid: str):
         )
         release.metadata["auto_review"] = bool(params.get("auto_review"))
         release.metadata["release_mode"] = params.get("release_mode") or "staged"
+        release.metadata["release_notes_l10n"] = params.get("release_notes_l10n") or {}
         _step(tid, f"包名: {release.package_name} v{release.version_name or '?'}")
         if release.version_name:
             _update(tid, version_name=release.version_name)  # 实际发布的版本号（含 catalog 回落）
@@ -1521,6 +1522,7 @@ class Handler(BaseHTTPRequestHandler):
         version_name = body.get("version_name") or ""
         version_code = body.get("version_code")
         release_notes = body.get("release_notes") or ""
+        release_notes_l10n = body.get("release_notes_l10n") or {}
         track = body.get("track") or ""
         apk_path = body.get("apk_path") or ""
         aab_path = body.get("aab_path") or ""
@@ -1556,7 +1558,7 @@ class Handler(BaseHTTPRequestHandler):
             _TASKS[tid]["release_mode"] = release_mode
             _PENDING_PATHS[tid].update({
                 "version_name": version_name, "version_code": version_code,
-                "release_notes": release_notes, "track": track,
+                "release_notes": release_notes, "release_notes_l10n": release_notes_l10n, "track": track,
                 "online_time": online_time,
                 "auto_review": auto_review,
                 "release_mode": release_mode,

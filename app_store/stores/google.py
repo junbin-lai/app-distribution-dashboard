@@ -194,6 +194,15 @@ class GoogleAdapter(StoreAdapter):
         edit = service.edits().insert(body={}, packageName=package).execute()
         edit_id = edit["id"]
         release_notes = release.whatsnew or release.release_notes or ""
+        # 多语言更新说明：中文 / 英文（英文留空回退中文；商店端对其他语言默认回退英文）
+        l10n = (release.metadata or {}).get("release_notes_l10n") or {}
+        zh_notes = (l10n.get("zh-CN") or "").strip() or release_notes
+        en_notes = (l10n.get("en-US") or "").strip() or zh_notes
+        release_notes_list = []
+        if zh_notes:
+            release_notes_list.append({"language": "zh-CN", "text": zh_notes})
+        if en_notes:
+            release_notes_list.append({"language": "en-US", "text": en_notes})
 
         try:
             if dry_run:
@@ -295,9 +304,7 @@ class GoogleAdapter(StoreAdapter):
                         "name": f"{version_code} ({release.version_name})" if release.version_name else str(version_code),
                         "versionCodes": [str(version_code)],
                         "status": "completed",
-                        "releaseNotes": (
-                            [{"language": "zh-CN", "text": release_notes}] if release_notes else []
-                        ),
+                        "releaseNotes": release_notes_list,
                     }
                 else:
                     release_body = {
@@ -305,9 +312,7 @@ class GoogleAdapter(StoreAdapter):
                         "versionCodes": [str(version_code)],
                         "status": "inProgress",
                         "userFraction": 0.000001,  # 百万分之一，审核通过后几乎无人收到更新
-                        "releaseNotes": (
-                            [{"language": "zh-CN", "text": release_notes}] if release_notes else []
-                        ),
+                        "releaseNotes": release_notes_list,
                     }
             else:
                 release_body = {

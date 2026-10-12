@@ -66,7 +66,7 @@ label{display:block;color:var(--mut);font-size:var(--font-label);margin:var(--sp
 .check{display:flex;align-items:center;gap:var(--space-2);margin:var(--space-3) 0;font-size:var(--font-body);color:var(--txt)}
 .check input{width:16px;height:16px;accent-color:var(--acc);margin:0}
 .actions{display:flex;gap:var(--space-2);margin:var(--space-3) 0}
-.status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:var(--space-3)}
+.status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:var(--space-3)}
 .state{display:inline-block;padding:3px var(--space-2);border-radius:var(--radius-sm);font-size:var(--font-caption);font-weight:600}
 .state.published{background:var(--tint-ok);color:var(--ok)}
 .state.reviewing{background:var(--tint-warn);color:var(--warn)}
@@ -110,6 +110,9 @@ label{display:block;color:var(--mut);font-size:var(--font-label);margin:var(--sp
 .row-between{display:flex;justify-content:space-between;align-items:center;gap:var(--space-2)}
 .row-between.start{align-items:flex-start}
 .section-head{display:flex;justify-content:space-between;align-items:center;gap:var(--space-2);margin-bottom:var(--space-2)}
+.l10n-tabs{display:flex;gap:var(--space-1);margin:var(--space-1) 0 var(--space-2)}
+.l10n-tabs .active{background:var(--acc);color:var(--btn-ink);border-color:transparent}
+.l10n-tabs .l10n-tab.active:hover{background:var(--acc);filter:none}
 .section-title{font-size:var(--font-title);color:var(--acc);font-weight:600;letter-spacing:-.01em}
 .eyebrow{font-size:var(--font-label);color:var(--mut);text-transform:uppercase;letter-spacing:.5px;font-weight:600}
 .card.dense{padding:var(--space-2) var(--space-3);margin-bottom:var(--space-2)}
@@ -146,7 +149,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 </div>
 <div id="toast" class="overlay" role="status" aria-live="polite" style="display:none"></div>
 <script>
-var ST={apps:[],cats:[],cur:null,plt:[],POLL:null};
+var ST={apps:[],cats:[],cur:null,plt:[],POLL:null,l10nNotes:{zh:"",en:""},l10nLang:"zh"};
 function $(v){return document.getElementById(v)}
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
 function iconSvg(n){var P={check:'<polyline points="20 6 9 17 4 12"/>',cross:'<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',bolt:'<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>',upload:'<line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>',warn:'<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>',sun:'<circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>',moon:'<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>'};return '<svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+(P[n]||"")+"</svg>"}
@@ -186,7 +189,7 @@ function stat(ch){var m={published:"已上架",reviewing:"审核中",pending:"�
 function ld(){Promise.all([api("/api/apps"),api("/api/platforms"),api("/api/config"),api("/api/tasks"),api("/api/session")]).then(function(rs){ST.apps=rs[0].apps||[];ST.cats=rs[0].categories||[];ST.platforms=rs[1]||[];$("cfg").textContent="凭证: "+(rs[2].credentials||"");ST.FS=(rs[2]&&rs[2].feishu)||null;ST.ME={username:rs[4]&&rs[4].username,role:rs[4]&&rs[4].role,auth_enabled:!!(rs[4]&&rs[4].auth_enabled)};renderMeBox();ST.HIST=(rs[3]&&rs[3].history)||[];renderSb();if(ST.apps.length){if(!ST.cur||!ST.apps.find(function(a){return a.id===ST.cur.id}))sa(ST.apps[0].id);else{renderMain();renderHistory(appHistory(5))}}}).catch(function(e){console.error(e)})}
 function renderSb(){var h="";(ST.cats||[]).forEach(function(c){h+='<div class=cat-title>'+esc(c.name)+"</div>";(ST.apps||[]).filter(function(a){return a.category===c.name}).forEach(function(a){var act=ST.cur&&ST.cur.id===a.id?"active":"";var dot=a.package_name?'<span class=dot style=background:var(--ok)></span>':'<span class=dot style=background:var(--warn)></span>';h+='<div class="app-item '+act+'" role="button" tabindex="0" aria-current="'+(act?"true":"false")+'" data-id="'+esc(a.id)+'" onclick="sa(this.dataset.id)">'+dot+'<span>'+esc(a.name)+"</span></div>"})});$("sb").innerHTML=h}
 function sa(id){ST.cur=(ST.apps||[]).find(function(a){return a.id===id})||null;ST.statuses=null;ST.GB=null;ST.GBSEL=null;var _sb=$("shareBtn");if(_sb)_sb.classList.add("hide");var _sg=$("sg");if(_sg)_sg.innerHTML="";var _ss=$("sgSection");if(_ss)_ss.style.display="none";renderSb();renderMain();renderHistory(appHistory(5))}
-function renderMain(){if(!ST.platforms&&!ST.apps.length){setTimeout(renderMain,250);return}var a=ST.cur;if(!a){$("appc").innerHTML='<div class=muted>请选择左侧应用</div>';return}
+function renderMain(){if(!ST.platforms&&!ST.apps.length){setTimeout(renderMain,250);return}var a=ST.cur;if(!a){$("appc").innerHTML='<div class=muted>请选择左侧应用</div>';return}ST.l10nNotes={zh:"",en:""};ST.l10nLang="zh";
 var h='<div class=app-head><h2>'+esc(a.name)+'</h2>'+(a.category_display?'<span class=badge>'+esc(a.category_display)+'</span>':'')+(a.package_name?'<span class="badge" style=color:var(--ok)>'+esc(a.package_name)+'</span>':'<span class="badge err">未配包名</span>')+"</div>";
 var admin=isAdmin();
 h+='<div class=grid><div class=card><h3>构建产物'+(admin?'':' <span class="muted" style="font-size:var(--font-caption)">（只读账号）</span>')+'</h3>'+
@@ -202,7 +205,7 @@ h+='<div class=card><h3>发布</h3>'+
 '<div><label for="ipvc">versionCode</label><input id="ipvc" readonly value=""></div>'+
 '<div><label>发布平台（可多选）</label><div id="ipp" style="display:flex;flex-wrap:wrap;gap:var(--space-2)">'+publishPlatsHTML()+'</div><div style="margin-top:var(--space-2)"><button type=button class=sm secondary onclick=platAll(1)>全选</button> <button type=button class=sm secondary onclick=platAll(0)>清空</button></div></div>'+
 '<div><label for="ipv">轨道（Google）</label><select id="ipv"><option>production</option><option>beta</option><option>alpha</option><option>internal</option></select></div>'+'<div><label for="iprm">Google 发布方式</label><select id="iprm"><option value="staged" selected>分阶段发布（审核通过后先放百万分之一，再手动全量）</option><option value="full">全量发布（审核通过后自动 100% 上线）</option></select></div>'+
-'<div><label for="ipn">更新说明</label><textarea id="ipn" rows="2"></textarea><div class="form-group"><label for="pot">定时上线（留空=立即）</label><input id="pot" type="datetime-local"></div></div>'+
+'<div><label for="ipn">更新说明</label><div class="l10n-tabs"><button type="button" class="sm secondary l10n-tab active" id="tabZh" onclick="swL10n(\'zh\')">中文</button><button type="button" class="sm secondary l10n-tab" id="tabEn" onclick="swL10n(\'en\')">English</button></div><textarea id="ipn" rows="2" placeholder="更新说明（中文）"></textarea><div class="form-group"><label for="pot">定时上线（留空=立即）</label><input id="pot" type="datetime-local"></div></div>'+
 '<div class=check><input type=checkbox id=ipdry checked><label for=ipdry>仅校验（不送审）</label> <input type="checkbox" id="ipauto" checked style="margin-left:var(--space-3)"><label for=ipauto>Google 自动送审</label></div>'+
 '<div class=actions>'+(a.query_only?'<button class=secondary disabled title="仅查询应用不支持发布">发布于 AGC 控制台</button>':(admin?'<button onclick=dpub()>发布</button>':'<button disabled title="只读账号（viewer）不可发布，需 admin 登录">发布（只读账号不可用）</button>'))+'</div></div>'+
 '<div class="card"><h3>平台状态</h3>'+
@@ -250,9 +253,16 @@ ST.cur.version_name=r.version_name||ST.cur.version_name;ST.cur.version_code=(r.v
 var rows=document.querySelectorAll('#appc .card .row');rows.forEach(function(ro){var k=ro.querySelector('.k');if(!k)return;if(k.textContent==='versionName'&&r.version_name){var v=ro.querySelector('.v');if(v)v.textContent=r.version_name}if(k.textContent==='versionCode'&&r.version_code!=null){var v2=ro.querySelector('.v');if(v2)v2.textContent=r.version_code}});
 }})
 })}
+function swL10n(lang){if(lang===ST.l10nLang)return;if(!ST.l10nNotes)ST.l10nNotes={zh:"",en:""};
+ST.l10nNotes[ST.l10nLang||"zh"]=$("ipn").value;ST.l10nLang=lang;
+$("ipn").value=ST.l10nNotes[lang]||"";$("ipn").placeholder=lang==="zh"?"更新说明（中文）":"Release notes (English)";
+var tz=$("tabZh"),te=$("tabEn");if(tz)tz.classList.toggle("active",lang==="zh");if(te)te.classList.toggle("active",lang==="en")}
 function dpub(){var a=ST.cur;if(!a||!a.package_name){toast("请选择应用（需配包名）","err");return}
 var ab_in=$("paab").value.trim(),ap_in=$("papk").value.trim();
-var body={app_id:a.id,platform:selPlats(),dry_run:$("ipdry").checked,auto_review:$("ipauto").checked,release_mode:$("iprm").value,version_name:$("ipvn").value.trim(),version_code:parseInt($("ipvc").value)||null,release_notes:$("ipn").value.trim(),track:$("ipv").value,aab_path:(ab_in||a.aab_build||""),apk_path:(ap_in||a.apk_build||""),online_time:document.getElementById("pot")?document.getElementById("pot").value.trim():""};
+if(ST.l10nNotes)ST.l10nNotes[ST.l10nLang||"zh"]=$("ipn").value;
+var zhNotes=(ST.l10nNotes&&ST.l10nNotes.zh||"").trim(),enNotes=(ST.l10nNotes&&ST.l10nNotes.en||"").trim();
+var l10n={};if(zhNotes)l10n["zh-CN"]=zhNotes;if(enNotes)l10n["en-US"]=enNotes;
+var body={app_id:a.id,platform:selPlats(),dry_run:$("ipdry").checked,auto_review:$("ipauto").checked,release_mode:$("iprm").value,version_name:$("ipvn").value.trim(),version_code:parseInt($("ipvc").value)||null,release_notes:zhNotes,release_notes_l10n:l10n,track:$("ipv").value,aab_path:(ab_in||a.aab_build||""),apk_path:(ap_in||a.apk_build||""),online_time:document.getElementById("pot")?document.getElementById("pot").value.trim():""};
 lg("== "+(body.dry_run?"Dry-run":"正式")+"发布 "+(a.name||a.id)+" ==");busy(true);api("/api/publish",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){if(r.task_id){lg("任务: "+r.task_id);startPoll(r.task_id)}else{lg("启动失败: "+JSON.stringify(r),"err");busy(false)}})}
 function renderTask(t){ST.LASTT=t;
 var stopBtn=$("tstop");if(stopBtn)stopBtn.style.display=((t.status==="running")&&isAdmin())?"":"none";
@@ -344,13 +354,13 @@ var list=(s||[]).slice().sort(function(a,b){return (order[a.platform]!==undefine
 if(!gridList.length){ST.statuses=null;if(sb)sb.classList.add("hide");e.innerHTML='<div class=muted>无数据</div>';return}
 gridList.sort(function(a,b){return (order[a.platform]!==undefined?order[a.platform]:99)-(order[b.platform]!==undefined?order[b.platform]:99)});ST.statuses=list;if(list.length&&sb)sb.classList.remove("hide");
 var h="";gridList.forEach(function(x){
-if(x._isErr){h+='<div class="card"><div class="section-head"><b style="font-size:var(--font-caption)">'+esc(nm[x.platform]||x.platform)+'</b><span class="state rejected">查询失败</span></div>'+row("错误信息",'<span style="color:var(--err)">'+esc(x._err)+'</span>')+'</div>';return}
+if(x._isErr){h+='<div class="card"><div class="section-head"><b style="font-size:var(--font-caption);white-space:nowrap">'+esc(nm[x.platform]||x.platform)+'</b><span class="state rejected" style="white-space:nowrap">查询失败</span></div>'+row("错误信息",'<span style="color:var(--err)">'+esc(x._err)+'</span>')+'</div>';return}
 var liveArr=(x.live_version_names||[]).slice();if(!liveArr.length&&x.live_version_codes)liveArr=x.live_version_codes.map(String);
 var live=liveArr.length?liveArr.join("<br>"):"-";
 var rev=(x.reviewing_version_names||[]).join(", ");var draft=(x.draft_version_names||[]).join(", ");var beta=(x.beta_version_names||[]).join(", ");var alpha=(x.alpha_version_names||[]).join(", ");var inter=(x.internal_version_names||[]).join(", ");var tst=[];if(beta)tst.push("Beta:"+beta);if(alpha)tst.push("Alpha:"+alpha);if(inter)tst.push("内测:"+inter);var tstRow=tst.join(" ；");
 var note=(x.audit_note||"").trim();
 var revText=note?esc(note):(rev?esc(rev):(x.state==="reviewing"?"审核中":"-"));
-h+='<div class="card"><div class="section-head"><b style="font-size:var(--font-caption)">'+esc(nm[x.platform]||x.platform)+'</b><span style="display:flex;gap:var(--space-2);align-items:center">'+((x.platform==="huawei"&&x.state==="pending"&&isAdmin())?'<button class=mini-btn onclick="confirmReleaseNow(\'huawei\')">立即上线</button>':"")+((x.platform==="google"&&(x.state==="published"||x.google_release_now)&&isAdmin())?'<button class=mini-btn onclick="confirmReleaseNow(\'google\')">全量发布</button>':"")+'<span class="state '+x.state+'">'+stat(x.state)+'</span></span></div>'+row("已上架版本",'<span class=v style="white-space:pre-line">'+live+'</span>')+row("审核状态",revText)+row("草稿未送审",draft?esc(draft):"-")+(tstRow?row("内测版本",esc(tstRow)):"")+'</div>'});
+h+='<div class="card"><div class="section-head"><b style="font-size:var(--font-caption);white-space:nowrap">'+esc(nm[x.platform]||x.platform)+'</b><span style="display:flex;gap:var(--space-2);align-items:center;flex-wrap:wrap;justify-content:flex-end">'+((x.platform==="huawei"&&x.state==="pending"&&isAdmin())?'<button class=mini-btn style="white-space:nowrap" onclick="confirmReleaseNow(\'huawei\')">立即上线</button>':"")+((x.platform==="google"&&x.google_release_now&&isAdmin())?'<button class=mini-btn style="white-space:nowrap" onclick="confirmReleaseNow(\'google\')">全量发布</button>':"")+'<span class="state '+x.state+'" style="white-space:nowrap">'+stat(x.state)+'</span></span></div>'+row("已上架版本",'<span class=v style="white-space:pre-line">'+live+'</span>')+row("审核状态",revText)+row("草稿未送审",draft?esc(draft):"-")+(tstRow?row("内测版本",esc(tstRow)):"")+'</div>'});
 e.innerHTML=h}
 function shareStatus(){
 var list=ST.statuses||[],a=ST.cur;
