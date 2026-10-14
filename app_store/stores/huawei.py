@@ -21,7 +21,7 @@ import urllib.parse
 from typing import Any, Dict, List, Tuple
 
 from ..base import StoreAdapter, StoreError
-from ..models import AuditState, Platform, Release, SubmitResult, StoreStatus, utcnow_iso
+from ..models import AuditState, Platform, Release, SubmitResult, StoreStatus, short_schedule, utcnow_iso
 from ..upload_progress import ProgressFile, make_multipart_monitor
 
 _DOMAIN = "https://connect-api.cloud.huawei.com"
@@ -301,7 +301,12 @@ class HuaweiAdapter(StoreAdapter):
         elif release_state in (1, 8):
             note = f"{curr_version} 审核未通过" if curr_version else "审核未通过"
         elif release_state == 3:
-            note = f"{curr_version} 审核通过" if curr_version else "审核通过"
+            # 待上架：app-info 带 releaseTime（定时上架时间）时展示定时时间
+            release_time = ai.get("releaseTime") or ""
+            if release_time:
+                note = f"待发布（定时 {short_schedule(release_time)}）"
+            else:
+                note = f"{curr_version} 审核通过" if curr_version else "审核通过"
         elif release_state == 0:
             note = ""  # 已上架由徽章/已上架版本行表达，不进审核状态
         return StoreStatus(
@@ -350,7 +355,12 @@ class HuaweiAdapter(StoreAdapter):
         elif release_state in (1, 8):
             note = f"{curr_version} 审核未通过" if curr_version else "审核未通过"
         elif release_state == 3:
-            note = f"{curr_version} 审核通过" if curr_version else "审核通过"
+            # 待上架：app-info 带 releaseTime（定时上架时间）时展示定时时间
+            release_time = ai.get("releaseTime") or ""
+            if release_time:
+                note = f"待发布（定时 {short_schedule(release_time)}）"
+            else:
+                note = f"{curr_version} 审核通过" if curr_version else "审核通过"
         elif release_state == 0:
             note = ""  # 已上架由徽章/已上架版本行表达，不进审核状态
         return StoreStatus(
@@ -371,6 +381,11 @@ class HuaweiAdapter(StoreAdapter):
         if cred.get("app_kind", "android") == "harmony":
             raise StoreError("华为 Harmony 仅支持查询版本；发布请在 AGC 控制台操作")
         if dry_run:
+            # dry-run 本地校验：凭证字段齐全 + 安装包存在（与其他国内平台一致）
+            if not cred.get("client_id") or not cred.get("client_secret"):
+                raise StoreError("华为 dry-run：缺少 client_id/client_secret")
+            if not release.apk_path or not os.path.isfile(release.apk_path):
+                raise StoreError(f"华为 dry-run：APK 不存在: {release.apk_path or '(未提供)'}")
             return SubmitResult(self.platform, True, "华为: dry-run 通过", state=AuditState.DRAFT)
 
         pkg = release.package_name

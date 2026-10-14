@@ -13,7 +13,7 @@ import hashlib, hmac, json, os, time, datetime as _dt
 from typing import Any, Dict, List, Optional
 
 from ..base import StoreAdapter, StoreError
-from ..models import AuditState, Platform, Release, SubmitResult, StoreStatus, utcnow_iso
+from ..models import AuditState, Platform, Release, SubmitResult, StoreStatus, short_schedule, utcnow_iso
 from ..upload_progress import make_multipart_monitor
 
 _DOMAIN = "https://oop-openapi-cn.heytapmobi.com"
@@ -268,8 +268,13 @@ class OPPOAdapter(StoreAdapter):
                 return None
         audit_i = _to_int(audit_status)
         change_i = _to_int(change_state)
+        # OPPO 状态文字含明确的「不通过/驳回」时优先判为驳回（audit_status=444 已实测，
+        # 其他驳回码可能 >111，不能只靠数值区间判断，否则会被误归为草稿）
+        rejected_by_name = bool(audit_name and ("不通过" in audit_name or "驳回" in audit_name))
         state = AuditState.UNKNOWN
-        if audit_i == 111 or change_i == 111:
+        if rejected_by_name or audit_i == 444 or change_i == 444:
+            state = AuditState.REJECTED
+        elif audit_i == 111 or change_i == 111:
             state = AuditState.PUBLISHED
         elif audit_i is not None and 0 < audit_i < 111:
             # 审核中；若已审核通过则进入"待发布"
@@ -277,8 +282,9 @@ class OPPOAdapter(StoreAdapter):
                 state = AuditState.PENDING
             else:
                 state = AuditState.REVIEWING
-        elif audit_i == 0 or (change_i is not None and change_i != 111):
+        elif audit_i == 0:
             state = AuditState.DRAFT
+        # 其余未知数值码（含 >111 的未文档化状态）保持 UNKNOWN，不再落入草稿
 
         # 已上架版本：仅 state=PUBLISHED 时当前版本才是线上
         # 版本归类按真实审核状态：仅"审核中"才进 reviewing；
@@ -293,20 +299,24 @@ class OPPOAdapter(StoreAdapter):
         online_i = _to_int(online_type)
         if state == AuditState.PENDING:
             if online_i == 2 and sche_time:
-                note = f"{version} 审核通过，定时发布（{sche_time}）"
+                note = f"待发布（定时 {short_schedule(sche_time)}）"
             else:
                 note = f"{version} 审核通过"
         elif state == AuditState.REVIEWING:
-            if audit_name and ("不通过" in audit_name or "驳回" in audit_name):
-                note = "审核未通过"
-            else:
-                note = "审核中"
+            note = "审核中"
         elif state == AuditState.REJECTED:
-            note = "审核未通过"
+            note = f"{version} 审核未通过" if version else "审核未通过"
         elif state == AuditState.DRAFT:
             note = "草稿"
         elif state == AuditState.PUBLISHED:
             note = ""  # 已上架由徽章/已上架版本行表达，不进审核状态
+
+        # 驳回时把平台驳回原因带给前端（hover/详情可见）
+        review_msg = audit_name or ""
+        if state == AuditState.REJECTED:
+            reason = str(data.get("refuse_reason") or "").strip().replace("\r", "").replace("\n", " ")
+            if reason:
+                review_msg = f"{audit_name}：{reason}" if audit_name else reason
 
         return StoreStatus(self.platform, package_name, state,
                            live_version_names=live_names,
@@ -314,7 +324,7 @@ class OPPOAdapter(StoreAdapter):
                            reviewing_version_names=reviewing_names,
                            draft_version_names=draft_names,
                            audit_note=note,
-                           review_message=audit_name or "",
+                           review_message=review_msg,
                            raw=payload, checked_at=utcnow_iso())
 
     @staticmethod

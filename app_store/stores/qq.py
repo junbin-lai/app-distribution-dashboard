@@ -31,7 +31,7 @@ import zipfile
 from typing import Any, Dict, List
 
 from ..base import StoreAdapter, StoreError
-from ..models import AuditState, Platform, Release, SubmitResult, StoreStatus, utcnow_iso
+from ..models import AuditState, Platform, Release, SubmitResult, StoreStatus, short_schedule, utcnow_iso
 from ..upload_progress import ProgressFile
 
 _DOMAIN = "https://p.open.qq.com/open_file/developer_api"
@@ -252,7 +252,14 @@ class QQAdapter(StoreAdapter):
         )
 
     # ---------- 查询 ----------
-    def query_status(self, package_name: str) -> StoreStatus:
+    def query_status(self, package_name: str, local_release: Dict[str, Any] = None) -> StoreStatus:
+        """local_release：本地最近一次成功提审任务的 {version_code, online_time}（可选）。
+
+        应用宝 /query_app_update_status 只有 1 审核中/2 驳回/3 通过/8 撤销，
+        没有「待发布」状态：定时发布(deploy_type=2)审核通过后仍返回 3，
+        与已真正上架无法区分。传入本地提审记录后，用「线上版本号仍小于
+        最近提审版本号」推断定时未到、版本未上线 → 待发布（定时 时间）。
+        """
         app_id = self._app_id(package_name)
         detail = self._api("/query_app_detail", {"pkg_name": package_name, "app_id": app_id})
         vname = str(detail.get("VersionName") or detail.get("version_name") or "")
@@ -265,6 +272,7 @@ class QQAdapter(StoreAdapter):
         state = AuditState.PUBLISHED
         note = ""
         review_msg = ""
+        audit = None
         try:
             st = self._api("/query_app_update_status", {"pkg_name": package_name, "app_id": app_id})
             audit = st.get("audit_status")
@@ -293,6 +301,20 @@ class QQAdapter(StoreAdapter):
         # REVIEWING/REJECTED 期间详情版本语义不明，不放已上架列表）
         live_names = [vname] if vname and state == AuditState.PUBLISHED else []
         live_codes = [vcode_i] if vcode_i and state == AuditState.PUBLISHED else []
+
+        # 定时发布推断：审核通过(3)但线上版本号仍小于本地最近提审版本号
+        # → 定时时间未到、版本未上线。仅 audit==3 时推断（撤销(8)/查询失败不猜）。
+        if (local_release and audit == 3 and state == AuditState.PUBLISHED
+                and local_release.get("online_time") and vcode_i):
+            try:
+                local_vc = int(local_release.get("version_code") or 0)
+            except (TypeError, ValueError):
+                local_vc = 0
+            if local_vc > vcode_i:
+                state = AuditState.PENDING
+                note = f"待发布（定时 {short_schedule(local_release['online_time'])}）"
+                # 已上架版本仍是线上老版本（上面已按 PUBLISHED 算好，保留展示）
+
         return StoreStatus(
             self.platform, package_name, state,
             live_version_names=live_names,

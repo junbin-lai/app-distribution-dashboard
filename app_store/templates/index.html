@@ -262,7 +262,10 @@ var ab_in=$("paab").value.trim(),ap_in=$("papk").value.trim();
 if(ST.l10nNotes)ST.l10nNotes[ST.l10nLang||"zh"]=$("ipn").value;
 var zhNotes=(ST.l10nNotes&&ST.l10nNotes.zh||"").trim(),enNotes=(ST.l10nNotes&&ST.l10nNotes.en||"").trim();
 var l10n={};if(zhNotes)l10n["zh-CN"]=zhNotes;if(enNotes)l10n["en-US"]=enNotes;
-var body={app_id:a.id,platform:selPlats(),dry_run:$("ipdry").checked,auto_review:$("ipauto").checked,release_mode:$("iprm").value,version_name:$("ipvn").value.trim(),version_code:parseInt($("ipvc").value)||null,release_notes:zhNotes,release_notes_l10n:l10n,track:$("ipv").value,aab_path:(ab_in||a.aab_build||""),apk_path:(ap_in||a.apk_build||""),online_time:document.getElementById("pot")?document.getElementById("pot").value.trim():""};
+var plats=selPlats(),plist=plats==="all"?[]:plats.split(",").map(function(s){return s.trim()});
+var needAab=plats==="all"||plist.indexOf("google")>=0;
+var needApk=plats==="all"||plist.some(function(p){return ["huawei","oppo","vivo","xiaomi","honor","qq"].indexOf(p)>=0});
+var body={app_id:a.id,platform:plats,dry_run:$("ipdry").checked,auto_review:$("ipauto").checked,release_mode:$("iprm").value,version_name:$("ipvn").value.trim(),version_code:parseInt($("ipvc").value)||null,release_notes:zhNotes,release_notes_l10n:l10n,track:$("ipv").value,aab_path:(needAab?(ab_in||a.aab_build||""):""),apk_path:(needApk?(ap_in||a.apk_build||""):""),online_time:document.getElementById("pot")?document.getElementById("pot").value.trim():""};
 lg("== "+(body.dry_run?"Dry-run":"正式")+"发布 "+(a.name||a.id)+" ==");busy(true);api("/api/publish",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){if(r.task_id){lg("任务: "+r.task_id);startPoll(r.task_id)}else{lg("启动失败: "+JSON.stringify(r),"err");busy(false)}})}
 function renderTask(t){ST.LASTT=t;
 var stopBtn=$("tstop");if(stopBtn)stopBtn.style.display=((t.status==="running")&&isAdmin())?"":"none";
@@ -478,7 +481,12 @@ function renderGSel(){var e=$("gsel");if(!e)return;var s=ST.GBSEL;if(!s){e.inner
 e.innerHTML='<div class=row><span class=k>版本</span><span class=v>'+esc(s.version_name||"—")+'（versionCode '+s.version_code+'）</span></div>'
 +'<div class=row><span class=k>发布状态</span><span class=v>'+esc(s.release_status||"—")+'</span></div>'
 +'<div style="margin-top:var(--space-2)"><button onclick="dapk()">下载签名 APK</button><span class="muted" style="font-size:var(--font-caption);margin-left:var(--space-2)">下载由浏览器接管</span></div>'}
-function dapk(){var a=ST.cur,s=ST.GBSEL;if(!a||!s)return;lg("== 从 Google Play 下载签名 APK: "+(s.version_name||s.version_code)+"（versionCode "+s.version_code+"） ==");var u="/api/google/apk?app_id="+encodeURIComponent(a.id)+"&version_code="+encodeURIComponent(s.version_code);var l=document.createElement('a');l.href=u;l.target="_blank";document.body.appendChild(l);l.click();l.remove();toast("已开始下载（由浏览器接管，进度看浏览器下载列表）");lg("已交给浏览器下载：该版本首次下载为实时从 Google 拉取（速度取决于 VPN），完成后自动缓存、下次秒下","ok")}
+function dapk(){var a=ST.cur,s=ST.GBSEL;if(!a||!s)return;var label=(s.version_name||s.version_code);lg("== 从 Google Play 下载签名 APK: "+label+"（versionCode "+s.version_code+"） ==");var q="app_id="+encodeURIComponent(a.id)+"&version_code="+encodeURIComponent(s.version_code);var u="/api/google/apk?"+q,cu="/api/google/apk/check?"+q;toast("正在检查该版本 APK 是否已就绪…");api(cu).then(function(r){if(!r.ok){var em=r.error||"APK 尚未就绪，请稍后重试";lg("下载预检失败: "+em,"err");toast(em,"err");return}var mb=r.size?("（"+(r.size/1048576).toFixed(1)+" MB"+(r.cached?" · 本地缓存":"")+"）"):"";lg("预检通过，APK 已就绪"+mb+"，开始下载"+(r.cached?"":"（首次从 Google 实时拉取，速度取决于 VPN）"),"ok");
+// 隐藏 iframe 触发下载：fetch 回调里已无用户点击手势，<a target=_blank>.click() 会被
+// 浏览器弹窗拦截器吞掉（表现为 toast 提示已下载但下载列表无反应）；iframe 加载
+// Content-Disposition: attachment 响应会直接进入下载列表，不弹新页、不被拦截
+var f=document.createElement('iframe');f.style.display='none';f.src=u;f.onload=function(){try{var b=f.contentDocument&&f.contentDocument.body;var d=b?b.innerText:"";if(d){var j=JSON.parse(d);if(j&&!j.ok){lg("下载失败: "+(j.error||"服务端错误"),"err");toast(j.error||"下载失败","err");document.body.removeChild(f)}}}catch(e){}};document.body.appendChild(f);
+toast("已开始下载"+mb+"，进度看浏览器下载列表")}).catch(function(e){lg("下载预检异常: "+e,"err");toast("预检异常","err")})}
 function validateAll(){lg("== 校验凭证 ==");api("/api/validate").then(function(r){(r.validated||[]).forEach(function(x){lg("["+x.platform+"] "+(x.ok?"OK":"ERROR")+(x.message?" "+x.message:""),x.ok?"ok":"err")})})}
 document.addEventListener("keydown",function(e){if(e.key!=="Enter"&&e.key!==" ")return;var t=e.target;if(!t||!t.classList)return;if(t.classList.contains("app-item")){e.preventDefault();sa(t.dataset.id)}else if(t.classList.contains("file-item")){e.preventDefault();pick(t)}else if(t.classList.contains("platform-chip")){e.preventDefault();selTPlat(t.dataset.plat)}});
 ld();

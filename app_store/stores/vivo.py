@@ -25,7 +25,7 @@ import urllib.parse
 from typing import Any, Dict, List
 
 from ..base import StoreAdapter, StoreError
-from ..models import AuditState, Platform, Release, SubmitResult, StoreStatus, utcnow_iso
+from ..models import AuditState, Platform, Release, SubmitResult, StoreStatus, short_schedule, utcnow_iso
 from ..upload_progress import make_multipart_monitor
 
 _DOMAIN = "https://developer-api.vivo.com.cn/router/rest"
@@ -254,7 +254,7 @@ class VivoAdapter(StoreAdapter):
         note = ""
         if state == AuditState.PENDING:
             if online_type == 2 and sche_val:
-                note = f"{version} 审核通过，定时发布（{sche_val}）"
+                note = f"待发布（定时 {short_schedule(sche_val)}）"
             else:
                 note = f"{version} 审核通过"
         elif state == AuditState.REVIEWING:

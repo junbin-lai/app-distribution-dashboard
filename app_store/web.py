@@ -413,24 +413,8 @@ def _publish_worker(tid: str):
     try:
         catalog = get_catalog(Handler.catalog_path)
         creds = load_credentials(Handler.credentials_path)
-        release = catalog.to_release(
-            app_id=app_id,
-            version_name=params.get("version_name", ""),
-            version_code=params.get("version_code"),
-            platform="google" if platform == "google" else "cn",
-            release_notes=params.get("release_notes", ""),
-            track=params.get("track", ""),
-            apk_path=params.get("apk", ""),
-            aab_path=params.get("aab", ""),
-            online_time=params.get("online_time"),
-        )
-        release.metadata["auto_review"] = bool(params.get("auto_review"))
-        release.metadata["release_mode"] = params.get("release_mode") or "staged"
-        release.metadata["release_notes_l10n"] = params.get("release_notes_l10n") or {}
-        _step(tid, f"包名: {release.package_name} v{release.version_name or '?'}")
-        if release.version_name:
-            _update(tid, version_name=release.version_name)  # 实际发布的版本号（含 catalog 回落）
-        _update(tid, progress=8, stage="读取配置")
+        # 先解析目标平台，再构造 Release：安装包路径只按目标平台附带，
+        # 避免目录里保存的其他平台旧路径（如已被清理的 APK 文件）阻塞本次发布
         if platform == "all":
             targets = [k for k in creds if k in PUBLISH_PLATFORMS]
             display = "全部已配平台"
@@ -444,6 +428,34 @@ def _publish_worker(tid: str):
         _step(tid, f"目标平台: {display}")
         # 回写解析后的平台列表（"all" 时前端芯片/标题能显示具体平台）
         _update(tid, platform=",".join(targets))
+
+        # 按目标平台解析安装包路径：Google 用 AAB、国内平台用 APK；
+        # 显式传入的路径优先，目录配置（aab_build/apk_build）仅在对应类型平台被发布时回落
+        _app = catalog.get_app(app_id)
+        _b = catalog._build_paths(_app)
+        need_aab = "google" in targets
+        need_apk = any(t != "google" for t in targets)
+        aab_p = params.get("aab", "") or (_b["aab"] if need_aab else "")
+        apk_p = params.get("apk", "") or (_b["apk"] if need_apk else "")
+        release = catalog.to_release(
+            app_id=app_id,
+            version_name=params.get("version_name", ""),
+            version_code=params.get("version_code"),
+            platform="google" if platform == "google" else "cn",
+            release_notes=params.get("release_notes", ""),
+            track=params.get("track", ""),
+            apk_path=apk_p,
+            aab_path=aab_p,
+            online_time=params.get("online_time"),
+            catalog_fallback=False,
+        )
+        release.metadata["auto_review"] = bool(params.get("auto_review"))
+        release.metadata["release_mode"] = params.get("release_mode") or "staged"
+        release.metadata["release_notes_l10n"] = params.get("release_notes_l10n") or {}
+        _step(tid, f"包名: {release.package_name} v{release.version_name or '?'}")
+        if release.version_name:
+            _update(tid, version_name=release.version_name)  # 实际发布的版本号（含 catalog 回落）
+        _update(tid, progress=8, stage="读取配置")
         # 并行发布：每个平台一个线程同时执行各自的发布流程，互不阻塞
         with _task_lock:
             if tid in _TASKS:
@@ -654,6 +666,36 @@ def _is_transient_query_error(msg: str) -> bool:
     return False
 
 
+def _latest_local_release(app_id: str, platform: str) -> Optional[Dict[str, Any]]:
+    """本地最近一次某平台成功提审的任务发布参数 {version_code, online_time}。
+
+    应用宝定时发布审核通过后接口只回 audit=3（无法区分已上架/待定时发布），
+    用最近一次成功提审的 version_code 与线上版本号比对来推断「待发布」。
+    取「最近成功提审任务」的参数：若最近一次是立即发布（无 online_time），
+    说明定时已被新提交覆盖，返回 None 不做推断。
+    """
+    best_key, best = "", None
+    with _task_lock:
+        for t in _TASKS.values():
+            if t.get("dry_run") or t.get("app_id") != app_id:
+                continue
+            finished = t.get("finished_at") or ""
+            if not finished:
+                continue  # 进行中的任务：此时必在审核中，用不上定时推断
+            results = t.get("results") or []
+            if not any(isinstance(r, dict) and r.get("platform") == platform and r.get("ok")
+                       for r in results):
+                continue
+            if finished >= best_key:
+                best_key, best = finished, {
+                    "version_code": t.get("version_code"),
+                    "online_time": t.get("online_time"),
+                }
+    if best and best.get("online_time") and best.get("version_code"):
+        return best
+    return None
+
+
 def query_app_status(app_id: str, platform: str = "all") -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """查询某应用在各平台的状态（/api/status 与飞书机器人共用这套实现）。
 
@@ -682,6 +724,9 @@ def query_app_status(app_id: str, platform: str = "all") -> Tuple[List[Dict[str,
                 adapter = get_adapter(key, creds)
                 if key == "huawei" and huawei_harmony_pkg:
                     s = adapter.query_status(package, huawei_harmony_pkg)
+                elif key == "qq":
+                    # 应用宝：带上本地最近提审记录，用于定时发布「待发布」推断
+                    s = adapter.query_status(package, local_release=_latest_local_release(app_id, "qq"))
                 else:
                     s = adapter.query_status(package)
                 return {
@@ -1002,6 +1047,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._api_app_icon()
             if path == "/api/google/bundles":
                 return self._api_google_bundles()
+            if path == "/api/google/apk/check":
+                return self._api_google_apk_check()
             if path == "/api/google/apk":
                 return self._api_google_apk()
             if path == "/api/platforms":
@@ -1359,11 +1406,43 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
+    def _api_google_apk_check(self):
+        """下载前快速预检（JSON）：本地有缓存直接返回，否则向 Google 发 1 字节 Range 探活。
+
+        前端先调本接口：未生成好/出错时给出明确提示，而不是让浏览器盲下载得到 0KB 文件；
+        返回 size 后浏览器立即知道文件总大小，下载条很快出现。
+        """
+        qs = parse_qs(urlparse(self.path).query)
+        app_id = (qs.get("app_id") or [""])[0].strip()
+        try:
+            version_code = int((qs.get("version_code") or [""])[0])
+        except ValueError:
+            raise StoreError("version_code 必须是整数")
+        if not app_id:
+            raise StoreError("缺少 app_id")
+        app = self._catalog().get_app(app_id)
+        package = str(app.get("package_name") or "").strip()
+        if not package:
+            raise StoreError("该应用未配置包名（package_name）")
+        safe_pkg = re.sub(r"[^A-Za-z0-9._-]", "_", package)
+        dest = os.path.join(self._downloads_dir(), f"{safe_pkg}-{version_code}.apk")
+        if os.path.isfile(dest):
+            return _json_response(self, {"ok": True, "ready": True, "cached": True,
+                                         "size": os.path.getsize(dest)})
+        creds = load_credentials(self.credentials_path)
+        if not creds.get("google"):
+            raise StoreError("未配置 Google 凭证（credentials.json google 段）")
+        adapter = get_adapter("google", creds)
+        result = adapter.probe_signed_apk(package, version_code)
+        result["cached"] = False
+        return _json_response(self, result, 200 if result.get("ok") else 409)
+
     def _api_google_apk(self):
         """下载指定 Bundle 版本的签名 APK（universal 整包，Play App Signing 密钥签名）。
 
         已缓存（downloads/{包名}-{versionCode}.apk）直接从本地发；未缓存则流式透传：
-        边从 Google 拉边转发给浏览器（下载条立即出现并显示进度），完成后落盘缓存。
+        边从 Google 拉边转发给浏览器（分块小、实时 flush，下载条持续有进度），完成后落盘缓存。
+        前端应先调 /api/google/apk/check 确认 APK 已生成，避免未就绪时得到 0KB 文件。
         """
         qs = parse_qs(urlparse(self.path).query)
         app_id = (qs.get("app_id") or [""])[0].strip()
@@ -1402,12 +1481,21 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
+                # 立即把响应头推给浏览器：下载弹窗立刻出现，不必等首个数据块
+                self.wfile.flush()
+                received = 0
                 try:
                     for chunk in stream:
                         self.wfile.write(chunk)
+                        # 每块实时 flush：浏览器持续看到字节数增长，而非长时间卡在 0 B/s
+                        self.wfile.flush()
+                        received += len(chunk)
                 except (ConnectionError, BrokenPipeError):
                     # 浏览器取消/断开：正常现象，停止拉取（finally 清理临时文件）
                     return
+                # 完整性校验：实传字节数与总大小不符（中途被掐但 socket 未报错）时不入缓存
+                if total and received != total:
+                    raise StoreError(f"下载不完整：已收到 {received} / {total} 字节")
                 os.replace(part, dest)
                 self._remember_google_version_name(package, version_code, dest)
                 return
@@ -1556,6 +1644,10 @@ class Handler(BaseHTTPRequestHandler):
             # 飞书通知要靠它判断 Google 是否真的送审（勾了自动送审才算送审成功）
             _TASKS[tid]["auto_review"] = auto_review
             _TASKS[tid]["release_mode"] = release_mode
+            # 定时发布推断要用（应用宝接口无「待发布」状态，需比对本地提审版本号）：
+            # 一并存进任务本身，随历史 JSON 持久化，重启后仍可查
+            _TASKS[tid]["online_time"] = online_time
+            _TASKS[tid]["version_code"] = version_code
             _PENDING_PATHS[tid].update({
                 "version_name": version_name, "version_code": version_code,
                 "release_notes": release_notes, "release_notes_l10n": release_notes_l10n, "track": track,

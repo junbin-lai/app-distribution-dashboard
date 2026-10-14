@@ -104,10 +104,13 @@ class AppCatalog:
         apk_path: str = "",
         aab_path: str = "",
         online_time: Optional[int] = None,
+        catalog_fallback: bool = True,
     ) -> Release:
         """把应用元数据转成 Release。platform 决定默认选哪个包。
 
         显式传 apk_path/aab_path 可覆盖目录配置；version/release_notes 可显式提供。
+        catalog_fallback=False 时不回落到目录里配置的 aab_build/apk_build
+        （调用方已按目标平台自行解析路径时使用，避免无关平台的旧路径阻塞发布）。
         """
         app = self.get_app(app_id)
         package = app.get("package_name") or ""
@@ -115,8 +118,8 @@ class AppCatalog:
             raise StoreError(f"应用 {app_id} 尚未配置 package_name（包名）")
 
         b = self._build_paths(app)
-        use_aab = _expand(aab_path) if aab_path else b["aab"]
-        use_apk = _expand(apk_path) if apk_path else b["apk"]
+        use_aab = _expand(aab_path) if aab_path else (b["aab"] if catalog_fallback else "")
+        use_apk = _expand(apk_path) if apk_path else (b["apk"] if catalog_fallback else "")
 
         # 校验（仅校验实际提供的路径存在）
         for label, p in (("AAB", use_aab), ("APK", use_apk)):

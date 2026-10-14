@@ -28,7 +28,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..base import StoreAdapter, StoreError
-from ..models import AuditState, Platform, Release, SubmitResult, StoreStatus, utcnow_iso
+from ..models import AuditState, Platform, Release, SubmitResult, StoreStatus, short_schedule, utcnow_iso
 from ..upload_progress import make_multipart_monitor
 
 _IAM_URL = "https://iam.developer.honor.com/auth/token"
@@ -398,9 +398,8 @@ class HonorAdapter(StoreAdapter):
         note = ""
         if state == AuditState.PENDING:
             if release_time:
-                # "2026-09-14T13:00:00+0800" → 转可读
-                rt = release_time.replace("T", " ").replace("+0800", "")
-                note = f"{version} 审核通过，定时发布（{rt}）"
+                # "2026-09-14T13:00:00+0800" → "09-14 13:00"
+                note = f"待发布（定时 {short_schedule(release_time)}）"
             else:
                 note = f"{version} 审核通过"
         elif state == AuditState.REVIEWING:

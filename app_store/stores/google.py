@@ -760,11 +760,56 @@ class GoogleAdapter(StoreAdapter):
                 return uni["downloadId"]
         raise StoreError("该版本未生成 universal 整包 APK，无法下载（可重试或换版本）")
 
+    def probe_signed_apk(self, package_name: str, version_code: int) -> Dict[str, Any]:
+        """快速探活（下载前预检）：校验 APK 是否已生成，并以 1 字节 Range GET 拿总大小。
+
+        - metadata list 阶段即可识别 409（还在生成中）/ 404（版本不存在）
+        - 1 字节 Range 请求流量极小、通常秒回，避免浏览器盲下载得到 0KB 文件
+        返回 {ok, ready, size, error}；不抛异常（调用方直接按 JSON 展示）。
+        """
+        from googleapiclient.errors import HttpError
+
+        try:
+            download_id = self._universal_apk_download_id(package_name, version_code)
+            service = self._service(package_name)
+            req = service.generatedapks().download_media(
+                packageName=package_name, versionCode=version_code, downloadId=download_id
+            )
+            # 1 字节 Range GET：Google 支持 Range（MediaIoBaseDownload 即靠它分块），
+            # 206 响应的 content-range "bytes 0-0/<总大小>" 可直接拿到整包字节数
+            resp, _content = req.http.request(req.uri, "GET", headers={"range": "bytes=0-0"})
+            status = getattr(resp, "status", None)
+            if status == 409:
+                return {"ok": False, "ready": False,
+                        "error": "该版本的 APK 还在生成中（Google 需要少量时间），请稍后重试"}
+            if status == 404:
+                return {"ok": False, "ready": False, "error": "Google 未找到该版本（确认 versionCode 为已上传的 App Bundle）"}
+            if status not in (200, 206):
+                return {"ok": False, "ready": False, "error": f"Google 探测返回 HTTP {status}"}
+            size = 0
+            cr = resp.get("content-range") if status == 206 else None
+            src = cr.rsplit("/", 1)[1] if cr and "/" in cr else resp.get("content-length")
+            try:
+                size = int(src) if src else 0
+            except (TypeError, ValueError):
+                size = 0
+            return {"ok": True, "ready": True, "size": size, "download_id": download_id}
+        except StoreError as e:
+            return {"ok": False, "ready": False, "error": str(e)}
+        except HttpError as e:
+            if getattr(e.resp, "status", None) == 409:
+                return {"ok": False, "ready": False,
+                        "error": "该版本的 APK 还在生成中（Google 需要少量时间），请稍后重试"}
+            return {"ok": False, "ready": False, "error": f"Google 探测失败: {e}"}
+        except Exception as e:
+            return {"ok": False, "ready": False, "error": f"Google 探测失败: {e}"}
+
     def stream_signed_apk(self, package_name: str, version_code: int, part_path: str):
         """流式拉取签名 APK（生成器）：先 yield 总字节数，再逐块 yield 数据。
 
         总大小要等第一块数据到达才知道（yield 给调用方发 Content-Length 用，
         浏览器下载条才能显示百分比）；数据块同时写入 part_path。
+        分块较小（256KB）且每块 flush，浏览器能持续看到进度而非长时间卡在 0 B/s。
         生成器自然结束 = 文件完整；中途异常/关闭由调用方负责清理 part 文件。
         """
         import googleapiclient.http
@@ -782,10 +827,11 @@ class GoogleAdapter(StoreAdapter):
 
                 def write(self, data):
                     fh.write(data)
+                    fh.flush()
                     captured.append(data)
 
             downloader = googleapiclient.http.MediaIoBaseDownload(
-                _Capture(), req, chunksize=8 * 1024 * 1024
+                _Capture(), req, chunksize=256 * 1024
             )
             done = False
             first = True

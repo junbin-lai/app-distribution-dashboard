@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, List
+
+import re
 
 
 class Platform(str, Enum):
@@ -132,3 +134,33 @@ class StoreStatus:
 
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# 「2026-10-15 09:34:00」/「2026-10-15T09:34」/「2026-10-15T09:34:00+0800」
+_SCHEDULE_RE = re.compile(r"^\d{4}-(\d{1,2})-(\d{1,2})[T ](\d{1,2}):(\d{2})")
+
+
+def short_schedule(value) -> str:
+    """定时时间缩写：'2026-10-15 09:34:00' / '2026-10-15T09:34' / 时间戳 → '10-15 09:34'。
+
+    用于「待发布（定时 10-15 09:00）」样式的时间部分；
+    时间戳按东八区换算，无法识别的格式原样返回。
+    """
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if not s:
+        return ""
+    m = _SCHEDULE_RE.match(s)
+    if m:
+        return f"{int(m[1]):02d}-{int(m[2]):02d} {int(m[3]):02d}:{m[4]}"
+    if s.isdigit():  # 毫秒/秒级时间戳 → 东八区
+        try:
+            ts = int(s)
+            if ts > 10 ** 12:
+                ts /= 1000
+            dt = datetime.fromtimestamp(ts, tz=timezone(timedelta(hours=8)))
+            return dt.strftime("%m-%d %H:%M")
+        except (ValueError, OSError, OverflowError):
+            pass
+    return s
