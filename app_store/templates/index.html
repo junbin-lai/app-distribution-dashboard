@@ -128,7 +128,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 <body>
 <header>
   <div style="display:flex;align-items:center;gap:var(--space-3)"><h1>App发布看板</h1><span class="muted" id="cfg"></span></div>
-  <div class=hdr-right><span class="muted" id="fsInfo"></span><span class="muted" id="meInfo"></span><button class="secondary sm hide" id="logoutBtn" onclick="logout()">退出登录</button><button class="secondary sm" id="themeBtn" onclick="toggleTheme()">深色</button><button class=secondary sm onclick=ld()>刷新</button><button class=secondary sm onclick=validateAll()>校验凭证</button></div>
+  <div class=hdr-right><span class="muted" id="fsInfo"></span><span class="muted" id="meInfo"></span><button class="secondary sm hide" id="userBtn" onclick="showUserModal()">用户管理</button><button class="secondary sm hide" id="logoutBtn" onclick="logout()">退出登录</button><button class="secondary sm" id="themeBtn" onclick="toggleTheme()">深色</button><button class=secondary sm onclick=ld()>刷新</button><button class=secondary sm onclick=validateAll()>校验凭证</button></div>
 </header>
 <div class=layout>
   <aside id=sb></aside>
@@ -173,11 +173,63 @@ api("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body
 if(r&&r.ok){location.reload()}else{b.disabled=false;err.textContent=(r&&r.error)||"登录失败"}}).catch(function(){b.disabled=false;err.textContent="网络错误"}) }
 function logout(){api("/api/logout",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(function(){location.reload()})}
 function isAdmin(){return !(ST.ME&&ST.ME.role==="viewer")}
-function renderMeBox(){var m=$("meInfo"),lo=$("logoutBtn"),fs=$("fsInfo");if(!m)return;
+function renderMeBox(){var m=$("meInfo"),lo=$("logoutBtn"),fs=$("fsInfo"),ub=$("userBtn");if(!m)return;
 var me=ST.ME||{};
-if(me.auth_enabled){m.textContent=(me.username||"?")+" · "+(me.role==="admin"?"管理员":"只读");lo.classList.remove("hide")}
-else{m.textContent="";lo.classList.add("hide")}
+if(me.auth_enabled){m.textContent=(me.username||"?")+" · "+(me.role==="owner"?"Owner":(me.role==="admin"?"管理员":"只读"));lo.classList.remove("hide");if(ub){me.role==="owner"?ub.classList.remove("hide"):ub.classList.add("hide")}}
+else{m.textContent="";lo.classList.add("hide");if(ub)ub.classList.add("hide")}
 if(fs){var f=ST.FS;if(f&&f.enabled){fs.textContent="飞书"+(f.connected?"已连接":(f.last_error?"异常":"连接中"))+(f.bound_chat?"":"·未绑通知群")}else fs.textContent=""}}
+// ==== 用户管理（仅 owner：增删改账号，密码自动哈希写回 board.json，改密/改角色后对方需重新登录） ====
+function roleName(r){return r==="owner"?"Owner":(r==="admin"?"管理员":"只读")}
+function roleSel(id,cur){return '<select id="'+id+'"><option value="viewer"'+(cur==="viewer"?" selected":"")+'>viewer（只读）</option><option value="admin"'+(cur==="admin"?" selected":"")+'>admin（可发布）</option><option value="owner"'+(cur==="owner"?" selected":"")+'>owner（超级管理员）</option></select>'}
+function showUserModal(){api("/api/users").then(function(r){if(!r||!r.ok){toast((r&&r.error)||"无法获取用户列表","err");return}
+ST.USERS=r.users||[];ST.EDITING=null;
+var h='<div class="overlay" onclick="if(event.target===this)cm()"><div class="modal" style="--modal-min-w:480px">'
++'<h3 class="section-title" style="margin-bottom:var(--space-3)">用户管理</h3><div id="uList"></div>'
++'<div style="margin-top:var(--space-4);border-top:1px solid var(--hairline);padding-top:var(--space-3)">'
++'<div class="eyebrow" style="margin-bottom:var(--space-2)">新增账号</div>'
++'<div class="input-row"><input id="nuUser" placeholder="用户名" autocomplete="off"></div>'
++'<div class="input-row"><input id="nuPass" type="password" placeholder="密码（至少 6 位）" autocomplete="new-password"></div>'
++'<div class="input-row">'+roleSel("nuRole","viewer")+'</div>'
++'<div style="margin-top:var(--space-2)"><button onclick="userAdd()">新增账号</button></div></div>'
++'<div style="margin-top:var(--space-3);text-align:right"><button class="secondary" onclick="cm()">关闭</button></div></div></div>';
+var d=document.createElement("div");d.innerHTML=h;document.body.appendChild(d.firstElementChild);
+renderUserList()})}
+function renderUserList(){var h="";(ST.USERS||[]).forEach(function(u,i){
+if(ST.EDITING===i){
+h+='<div style="padding:var(--space-2) 0;border-bottom:1px solid var(--line)">'
++'<div class="row"><span class="k">账号</span><span class="v">'+esc(u.username)+'（当前 '+roleName(u.role)+'）</span></div>'
++'<div style="margin-top:var(--space-2)"><label>新密码（留空 = 不修改）</label><input id="euPass" type="password" placeholder="至少 6 位" autocomplete="new-password"></div>'
++'<div style="margin-top:var(--space-2)"><label>角色</label>'+roleSel("euRole",u.role)+'</div>'
++'<div style="display:flex;gap:var(--space-2);margin-top:var(--space-3)"><button onclick="userSave('+i+')">保存</button><button class="secondary" onclick="userEdit(-1)">取消</button></div></div>'
+}else{
+h+='<div style="display:flex;align-items:center;gap:var(--space-2);padding:var(--space-2) 0;border-bottom:1px solid var(--line)">'
++'<span style="flex:1">'+esc(u.username)+'</span><span class="badge">'+roleName(u.role)+'</span>'
++'<button class="secondary sm" onclick="userEdit('+i+')">编辑</button>'
++'<button class="secondary sm" style="color:var(--err)" onclick="confirmUserDel('+i+')">删除</button></div>'}
+});
+if(!(ST.USERS||[]).length)h+='<div class="muted" style="padding:var(--space-2) 0">暂无账号</div>';
+$("uList").innerHTML=h}
+function refreshUsers(){api("/api/users").then(function(r){if(!r||!r.ok)return;ST.USERS=r.users||[];ST.EDITING=null;renderUserList()})}
+function userEdit(i){ST.EDITING=i;renderUserList()}
+function userAdd(){var u=$("nuUser"),p=$("nuPass"),r=$("nuRole");if(!u||!p||!r)return;
+if(!u.value.trim()||!p.value){toast("请填写用户名和密码","err");return}
+api("/api/users",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:u.value.trim(),password:p.value,role:r.value})}).then(function(res){
+if(!res||!res.ok){toast((res&&res.error)||"新增失败","err");return}
+toast("已新增账号 "+u.value.trim());u.value="";p.value="";refreshUsers()}).catch(function(){toast("网络错误","err")})}
+function userSave(i){var u=(ST.USERS||[])[i];if(!u)return;var p=$("euPass"),r=$("euRole");if(!p||!r)return;
+var body={username:u.username,role:r.value};if(p.value)body.password=p.value;
+api("/api/users/update",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(res){
+if(!res||!res.ok){toast((res&&res.error)||"保存失败","err");return}
+// 改的是自己的账号：服务端已踢掉当前会话，重新登录后刷新整页
+if(ST.ME&&ST.ME.username===u.username){toast("已保存，请重新登录");setTimeout(function(){location.reload()},900);return}
+toast("已保存 "+u.username+" 的修改");refreshUsers()}).catch(function(){toast("网络错误","err")})}
+function confirmUserDel(i){var u=(ST.USERS||[])[i];if(!u)return;cm();
+var h='<div class="overlay" onclick="if(event.target===this)cm()"><div class="modal" style="text-align:center;--modal-min-w:340px"><p style="margin:var(--space-2) 0 var(--space-3);font-size:var(--font-title);font-weight:600">删除账号</p><p style="color:var(--mut);font-size:var(--font-body);margin-bottom:var(--space-5)">确定删除账号 <b>'+esc(u.username)+'</b>（'+roleName(u.role)+'）？该账号会被立即踢下线且无法再登录。</p><div style="display:flex;gap:var(--space-2);justify-content:center"><button onclick="userDel('+i+')" style="background:var(--err)">删除</button><button class="secondary" onclick="cm()">取消</button></div></div></div>';
+var d=document.createElement("div");d.innerHTML=h;document.body.appendChild(d.firstElementChild)}
+function userDel(i){var u=(ST.USERS||[])[i];if(!u)return;cm();
+api("/api/users/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:u.username})}).then(function(res){
+if(!res||!res.ok){toast((res&&res.error)||"删除失败","err");showUserModal();return}
+toast("已删除账号 "+u.username);showUserModal()}).catch(function(){toast("网络错误","err")})}
 function toast(m,t){var e=$("toast");e.style.display="flex";e.innerHTML='<div class="modal" style="width:auto;max-width:400px;text-align:center">'+esc(m)+'<div style="margin-top:12px"><button id=tb>确定</button></div></div>';e.style.background="transparent";clearTimeout(e._t);e._t=setTimeout(close,2600);var b=e.querySelector('#tb');if(b)b.addEventListener('click',close)}
 function close(){ $("toast").style.display="none" }
 function lg(t,c){var e=$("lg");if(e){var d=document.createElement("div");d.className=c||"";d.textContent=t;e.appendChild(d);e.scrollTop=e.scrollHeight}}
@@ -186,7 +238,15 @@ function setTheme(t){document.documentElement.dataset.theme=t;try{localStorage.s
 function toggleTheme(){setTheme(document.documentElement.dataset.theme==="dark"?"light":"dark")}
 setTheme(function(){try{return localStorage.getItem("dshTheme")||"light"}catch(e){return "light"}}());
 function stat(ch){var m={published:"已上架",reviewing:"审核中",pending:"待发布",draft:"草稿",submitted:"已提交",rejected:"已拒绝",unknown:"未知"};return m[ch]||ch}
-function ld(){Promise.all([api("/api/apps"),api("/api/platforms"),api("/api/config"),api("/api/tasks"),api("/api/session")]).then(function(rs){ST.apps=rs[0].apps||[];ST.cats=rs[0].categories||[];ST.platforms=rs[1]||[];$("cfg").textContent="凭证: "+(rs[2].credentials||"");ST.FS=(rs[2]&&rs[2].feishu)||null;ST.ME={username:rs[4]&&rs[4].username,role:rs[4]&&rs[4].role,auth_enabled:!!(rs[4]&&rs[4].auth_enabled)};renderMeBox();ST.HIST=(rs[3]&&rs[3].history)||[];renderSb();if(ST.apps.length){if(!ST.cur||!ST.apps.find(function(a){return a.id===ST.cur.id}))sa(ST.apps[0].id);else{renderMain();renderHistory(appHistory(5))}}}).catch(function(e){console.error(e)})}
+function ld(){Promise.all([api("/api/apps"),api("/api/platforms"),api("/api/config"),api("/api/tasks"),api("/api/session")]).then(function(rs){ST.apps=rs[0].apps||[];ST.cats=rs[0].categories||[];ST.platforms=rs[1]||[];$("cfg").textContent="凭证: "+(rs[2].credentials||"");ST.FS=(rs[2]&&rs[2].feishu)||null;ST.ME={username:rs[4]&&rs[4].username,role:rs[4]&&rs[4].role,auth_enabled:!!(rs[4]&&rs[4].auth_enabled)};renderMeBox();ST.HIST=(rs[3]&&rs[3].history)||[];renderSb();if(ST.apps.length){if(!ST.cur||!ST.apps.find(function(a){return a.id===ST.cur.id}))sa(ST.apps[0].id);else{renderMain();renderHistory(appHistory(5))}}
+// === 恢复进行中的发布任务：发布在服务端后台线程运行，刷新/关闭重进页面都不影响。
+// 页面加载时若存在 running 任务，自动切到该应用并继续显示进度，任务结束后自动停止。
+// 多个任务同时进行时先显示最后提交的，结束后自动接显下一个（终态后自动衔接）。===
+var run=(rs[3]&&rs[3].running)||[];
+if(run.length){var rt=run[run.length-1];
+if(rt.app_id&&ST.apps.find(function(a){return a.id===rt.app_id})){sa(rt.app_id)}
+startPoll(rt.id);busy(true);
+if(run.length>1){lg("（另有 "+(run.length-1)+" 个任务同时在发布中，结束后会自动接着显示）","")}}}).catch(function(e){console.error(e)})}
 function renderSb(){var h="";(ST.cats||[]).forEach(function(c){h+='<div class=cat-title>'+esc(c.name)+"</div>";(ST.apps||[]).filter(function(a){return a.category===c.name}).forEach(function(a){var act=ST.cur&&ST.cur.id===a.id?"active":"";var dot=a.package_name?'<span class=dot style=background:var(--ok)></span>':'<span class=dot style=background:var(--warn)></span>';h+='<div class="app-item '+act+'" role="button" tabindex="0" aria-current="'+(act?"true":"false")+'" data-id="'+esc(a.id)+'" onclick="sa(this.dataset.id)">'+dot+'<span>'+esc(a.name)+"</span></div>"})});$("sb").innerHTML=h}
 function sa(id){ST.cur=(ST.apps||[]).find(function(a){return a.id===id})||null;ST.statuses=null;ST.GB=null;ST.GBSEL=null;var _sb=$("shareBtn");if(_sb)_sb.classList.add("hide");var _sg=$("sg");if(_sg)_sg.innerHTML="";var _ss=$("sgSection");if(_ss)_ss.style.display="none";renderSb();renderMain();renderHistory(appHistory(5))}
 function renderMain(){if(!ST.platforms&&!ST.apps.length){setTimeout(renderMain,250);return}var a=ST.cur;if(!a){$("appc").innerHTML='<div class=muted>请选择左侧应用</div>';return}ST.l10nNotes={zh:"",en:""};ST.l10nLang="zh";
@@ -325,18 +385,23 @@ se.innerHTML=sl.map(function(s,i){var st;
   var icon=st==="ok"?iconSvg("check"):st==="err"?iconSvg("cross"):iconSvg("bolt");
   return '<div><span class="icon '+st+'" aria-hidden="true">'+icon+'</span>'+esc(s)+"</div>"
 }).join("");se.scrollTop=se.scrollHeight}
-function startPoll(tid){ST.POLL=tid;ST.TSEL="";ST.LASTT=null;$("progress").classList.remove("hide");$("tsteps").innerHTML="";$("tup").textContent="";poll()}
+function startPoll(tid){ST.POLL=tid;ST.TSEL="";ST.LASTT=null;ST.MCLOSE=false;$("progress").classList.remove("hide");$("tsteps").innerHTML="";$("tup").textContent="";poll()}
 function selTPlat(p){ST.TSEL=(ST.TSEL===p?"":p);if(ST.LASTT)renderTask(ST.LASTT)}
 function poll(){if(!ST.POLL)return;api("/api/tasks/"+ST.POLL).then(function(t){if(t.error){lg("查询失败","err");stopPoll();return}
 renderTask(t)
 // === 任务结束：日志 + 手动关闭 × ===
-if(t.status==="done"||t.status==="error"||t.status==="killed"){var stopped=t.status==="killed";var isOk=t.status==="done"&&!(t.errors||[]).length&&!(t.results||[]).some(function(v){return !v.ok});
-$("tclose").style.display="inline-block";$("tclose").onclick=function(){stopPoll()};
+if(t.status==="done"||t.status==="error"||t.status==="killed"){ST.POLL=null;var stopped=t.status==="killed";var isOk=t.status==="done"&&!(t.errors||[]).length&&!(t.results||[]).some(function(v){return !v.ok});
+$("tclose").style.display="inline-block";$("tclose").onclick=function(){ST.MCLOSE=true;stopPoll()};
 lg("== "+(stopped?"✓ 发布已停止":(isOk?"✓ 发布成功":"✗ 发布有错误"))+" ==",stopped||isOk?"ok":"err");
 (t.results||[]).forEach(function(v){lg("["+v.platform+"] "+(v.ok?"✓ ":"✗ ")+v.message,v.ok?"ok":"err")});
 (t.errors||[]).forEach(function(v){lg("["+v.platform+"] 错误:"+v.error,"err")});
-// 任务结束：刷新发布历史显示（后端已落盘，此处重新拉取展示）
-api("/api/tasks").then(function(tr){ST.HIST=(tr&&tr.history)||[];renderHistory(appHistory(5))});
+// 任务结束：刷新发布历史显示（后端已落盘，此处重新拉取展示）；
+// 若还有其他进行中任务且用户没手动关掉进度面板 → 自动接显下一个
+api("/api/tasks").then(function(tr){ST.HIST=(tr&&tr.history)||[];renderHistory(appHistory(5));
+var more=(tr&&tr.running)||[];
+if(more.length&&!ST.MCLOSE){var nt=more[more.length-1];
+if(nt.app_id&&ST.apps.find(function(a){return a.id===nt.app_id})){sa(nt.app_id)}
+startPoll(nt.id);lg("（接续显示下一个进行中的任务）","");busy(true)}});
 busy(false)}
 else{$("tclose").style.display="none";setTimeout(poll,600)}}).catch(function(){setTimeout(poll,1500)})}
 function stopPoll(){ST.POLL=null;$("tclose").style.display="none";var sb=$("tstop");if(sb)sb.style.display="none";$("progress").classList.add("hide")}

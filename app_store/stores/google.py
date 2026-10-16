@@ -32,6 +32,42 @@ _PAGE_VERSION_CACHE: Dict[str, tuple] = {}
 _PAGE_VERSION_TTL_SECONDS = 300
 _PAGE_VERSION_FAIL_TTL_SECONDS = 60
 
+# 新 lifecycle 接口的失败可观测性：静默退回旧推断时，把失败原因记录在此，
+# 看板状态卡用 audit_note 提示「新接口不可用，状态为旧推断」。
+# key=package_name, value={"reason": str, "at": monotonic, "http_status": int|None}
+_LIFECYCLE_FAIL: Dict[str, dict] = {}
+_LIFECYCLE_FAIL_TTL_SECONDS = 1800  # 看板提示保留 30 分钟
+# 同一原因的 stderr 日志限频（10 分钟一条），避免反复查询时刷屏
+_LIFECYCLE_LAST_LOG: Dict[str, float] = {}
+_LIFECYCLE_LOG_THROTTLE = 600
+# lifecycle 接口专用 AuthorizedHttp 缓存（按包名）：复用凭证对象，google-auth
+# 会在 token 过期时自动刷新，避免每次状态查询都多一次 OAuth 往返
+_LIFECYCLE_HTTP_CACHE: Dict[str, Any] = {}
+
+
+def lifecycle_failure_note(package_name: str) -> str:
+    """返回某包名 lifecycle 接口近期的失败提示（无失败时空串），供查询状态展示。"""
+    f = _LIFECYCLE_FAIL.get(package_name)
+    if not f:
+        return ""
+    age = time.monotonic() - float(f.get("at", 0))
+    if age > _LIFECYCLE_FAIL_TTL_SECONDS:
+        _LIFECYCLE_FAIL.pop(package_name, None)
+        return ""
+    return f"新发布状态接口暂不可用（{f.get('reason') or '未知错误'}），当前为旧版推断结果，审核/灰度状态可能不准"
+
+
+def _record_lifecycle_failure(package_name: str, reason: str,
+                              http_status: Optional[int] = None) -> None:
+    now = time.monotonic()
+    _LIFECYCLE_FAIL[package_name] = {"reason": reason, "at": now, "http_status": http_status}
+    key = f"{package_name}|{http_status or ''}|{reason[:40]}"
+    last = _LIFECYCLE_LAST_LOG.get(key, 0.0)
+    if now - last > _LIFECYCLE_LOG_THROTTLE:
+        _LIFECYCLE_LAST_LOG[key] = now
+        print(f"Google Play release 生命周期查询失败（退回旧推断）[{package_name}] "
+              f"http={http_status}: {reason}", file=sys.stderr)
+
 
 class _ProgressFile:
     """文件包装：httplib2 分块读文件时回调当前已传大小 → 看板实时显示上传进度。"""
@@ -287,7 +323,8 @@ class GoogleAdapter(StoreAdapter):
             if is_aab:
                 if scb:
                     scb("等待 Google 处理（processing）…")
-                self._wait_processing(service, package, edit_id, version_code)
+                self._wait_processing(service, package, edit_id, version_code,
+                                      kill_cb=(release.metadata or {}).get("_kill_cb"))
 
             if scb:
                 scb("提交发布（tracks.update → commit）…")
@@ -352,6 +389,10 @@ class GoogleAdapter(StoreAdapter):
                 state=AuditState.SUBMITTED,
                 raw={"edit_id": edit_id, "version_code": version_code, "is_aab": is_aab, "release_mode": release_mode},
             )
+        except TaskKilledError:
+            # 用户停止：直接传播、不再清理 edit（清 edit 要多一次跨国 API 调用，
+            # VPN 慢时最坏卡到 300s 超时才停；未 commit 的 edit 无副作用，24h 自动失效）
+            raise
         except Exception as e:
             # StoreError 路径同样清理已创建的 edit；删除失败只记录，不掩盖原始错误
             try:
@@ -362,11 +403,17 @@ class GoogleAdapter(StoreAdapter):
                 raise
             raise StoreError(f"Google Play 发布失败: {e}")
 
-    def _wait_processing(self, service, package: str, edit_id: str, version_code: Any) -> None:
-        """等待大 AAB processing 完成后再 commit（避免 500）。不阻塞太久。"""
+    def _wait_processing(self, service, package: str, edit_id: str, version_code: Any, kill_cb=None) -> None:
+        """等待大 AAB processing 完成后再 commit（避免 500）。不阻塞太久。
+
+        kill_cb：停止请求检查回调（每次轮询前调用，抛 TaskKilledError 立即中断等待）。
+        必须放在 try 外：轮询异常分支会吞掉 try 内抛出的 TaskKilledError。
+        """
         import time
         waited = 0
         while waited < _PROCESSING_MAX_WAIT:
+            if kill_cb:
+                kill_cb()
             try:
                 bundles = (
                     service.edits()
@@ -403,6 +450,79 @@ class GoogleAdapter(StoreAdapter):
             return "包名不存在或账号无权访问"
         return "可能是包名/服务账号权限问题"
 
+    # applications.tracks.releases（2026-09 起的新接口）：直接给出每个 release 的
+    # 真实审核生命周期，弥补 tracks.list 无法区分「审核中 inProgress」与
+    # 「审核通过后灰度中 inProgress」的盲区。
+    _RELEASE_LIFECYCLE_URL = (
+        "https://androidpublisher.googleapis.com/androidpublisher/v3/"
+        "applications/{pkg}/tracks/{track}/releases"
+    )
+
+    def _lifecycle_http(self, package_name: str):
+        """lifecycle 接口专用 AuthorizedHttp，按包名+凭证源缓存复用。
+
+        google-auth 自带 token 过期刷新（复用对象不再重复取 token），
+        不缓存的话每次状态查询都多一次 OAuth 往返（跨国网络 0.3-2s）。
+        key 含凭证源（路径/内联 JSON 串）：credentials.json 热加载换凭证后
+        自动用新 key 建新连接，不会拿到旧凭证的缓存。
+        取不到凭证时抛异常由调用方兜底。
+        """
+        src = str((self._cred_for(package_name).get("service_account_json") or ""))
+        key = f"{package_name}|{src}"
+        http = _LIFECYCLE_HTTP_CACHE.get(key)
+        if http is not None:
+            return http
+        sa = self._load_creds(package_name)
+        from google.oauth2 import service_account
+        import httplib2 as _hb2
+        from google_auth_httplib2 import AuthorizedHttp
+        creds = service_account.Credentials.from_service_account_info(
+            sa, scopes=[_ANDROIDPUBLISHER_SCOPE])
+        http = AuthorizedHttp(creds, http=_hb2.Http(timeout=30))
+        _LIFECYCLE_HTTP_CACHE[key] = http
+        return http
+
+    def _release_lifecycle(self, package_name: str, track: str = "production") -> Dict[str, str]:
+        """查询某轨道各 versionCode 的真实审核生命周期（新接口，只读）。
+
+        返回 {version_code(str): lifecycle}，lifecycle 取值：
+          RELEASE_LIFECYCLE_STATE_DRAFT / _IN_REVIEW / _APPROVED_NOT_PUBLISHED / _PUBLISHED
+        任何失败（接口不可用/权限/网络）都返回 {}，由调用方退回旧的 tracks.list 推断；
+        失败原因记入 _LIFECYCLE_FAIL 供看板提示（成功时清除）。
+        """
+        try:
+            http = self._lifecycle_http(package_name)
+            url = self._RELEASE_LIFECYCLE_URL.format(pkg=package_name, track=track)
+            resp, content = http.request(url, method="GET")
+            if resp.status != 200:  # 204=该轨道无发布记录（正常，不算故障）
+                if resp.status == 204:
+                    _LIFECYCLE_FAIL.pop(package_name, None)
+                else:
+                    reason = {
+                        403: "服务账号无新接口权限（403）",
+                        404: "接口地址未开放（404）",
+                        401: "凭证未授权（401）",
+                        429: "Google 接口限流（429）",
+                        500: "Google 服务错误（500）",
+                        503: "Google 服务不可用（503）",
+                    }.get(resp.status, f"HTTP {resp.status}")
+                    _record_lifecycle_failure(package_name, reason, resp.status)
+                return {}
+            data = json.loads(content)
+        except Exception as e:
+            _record_lifecycle_failure(package_name, str(e)[:80])
+            return {}
+        out: Dict[str, str] = {}
+        for r in data.get("releases") or []:
+            state = r.get("releaseLifecycleState") or ""
+            for art in r.get("activeArtifacts") or []:
+                vc = str(art.get("versionCode") or "")
+                if vc and state:
+                    out[vc] = state
+        # 查询成功（含空轨道）：清除历史失败标记
+        _LIFECYCLE_FAIL.pop(package_name, None)
+        return out
+
     def query_status(self, package_name: str) -> StoreStatus:
         service = self._service(package_name)
         try:
@@ -426,15 +546,58 @@ class GoogleAdapter(StoreAdapter):
                 pass
 
         raw_tracks = resp.get("tracks", [])
+        # 新接口的真实审核生命周期 {versionCode: RELEASE_LIFECYCLE_STATE_*}；
+        # 为空时（接口失败/无权限）下面全部退回旧的 tracks.status 推断。
+        lifecycle = self._release_lifecycle(package_name, "production")
+
         live_codes: List[int] = []
         live_names: List[str] = []
         draft_names: List[str] = []
         reviewing_names: List[str] = []
-        pending_names: List[str] = []
+        # (版本名, 类型)：rollout=审核通过后灰度中（可点全量发布）；
+        #                approved=审核通过待发布（定时/自管式，需到 Play Console 确认）
+        pending_entries: List[tuple] = []
+        rejected_names: List[str] = []
         review_msgs: List[str] = []
         audit_note: str = ""
         release_now = False
         prod_completed: List[Dict[str, Any]] = []
+
+        def _lc_of(codes) -> str:
+            """该 release 的生命周期（多 versionCode 时取第一个）。"""
+            return lifecycle.get(str(codes[0]), "") if codes else ""
+
+        def _lc_kind(lc: str) -> str:
+            """生命周期 → review/approved/rollout/draft/reject/unknown。"""
+            if lc.endswith("_IN_REVIEW"):
+                return "review"
+            if lc.endswith("_APPROVED_NOT_PUBLISHED"):
+                return "approved"
+            if lc.endswith("_PUBLISHED"):
+                return "rollout"
+            if lc.endswith("_DRAFT"):
+                return "draft"
+            if "REJECT" in lc or "NOT_APPROVED" in lc:
+                return "reject"
+            return "unknown"
+
+        def _apply_kind(kind: str, track_name: str, nm: str) -> None:
+            """按 kind 登记审核消息与版本列表（inProgress/draft/completed 三分支共用）。"""
+            if kind == "review":
+                review_msgs.append(f"{track_name}:审核中 ({nm})")
+                if nm and nm not in reviewing_names:
+                    reviewing_names.append(nm)
+            elif kind == "approved":
+                review_msgs.append(f"{track_name}:审核通过待发布 ({nm})")
+                pending_entries.append((nm, "approved"))
+            elif kind == "reject":
+                review_msgs.append(f"{track_name}:审核未通过 ({nm})")
+                if nm and nm not in rejected_names:
+                    rejected_names.append(nm)
+            elif kind == "draft":
+                review_msgs.append(f"{track_name}:草稿未送审 ({nm})")
+                if nm and nm not in draft_names:
+                    draft_names.append(nm)
 
         beta_names: List[str] = []
         alpha_names: List[str] = []
@@ -459,31 +622,45 @@ class GoogleAdapter(StoreAdapter):
                 nm = _ver_text(name)
                 status = rel.get("status", "")
                 if status == "inProgress":
-                    # 分阶段发布（inProgress + userFraction）：
-                    #   · production 轨道 → 显示为「待发布」而非「审核中」。
-                    #     Google Play API 没有审核状态字段，inProgress 既可能是「审核中」，
-                    #     也可能是「审核通过后按比例灰度中」；我们用的比例是百万分之一，
-                    #     约等于没人收得到更新，语义上更接近「还没正式发布」，故归为待发布。
-                    #     （Google 后续若提供真实的待发布/拒绝字段，再改成准确归类。）
-                    #   · 其他轨道（beta/alpha/internal）保持「审核中」，不参与全量发布。
+                    # production 的 inProgress 有两种语义，旧 tracks API 无法区分：
+                    #   ① 刚提审、审核中（百万分之一 userFraction 只是占位，审核通过后才生效）
+                    #   ② 审核通过后正在按比例灰度中（点「全量发布」可转正式版）
+                    # 新接口 releaseLifecycleState 可精确区分；拿不到时退回旧推断（按灰度中处理）。
+                    # 其他轨道（beta/alpha/internal）保持「审核中」，不参与全量发布。
                     if track_name == "production":
-                        release_now = True
-                        review_msgs.append(f"{track_name}:分阶段发布中 ({nm})")
-                        if nm and nm not in pending_names:
-                            pending_names.append(nm)
+                        kind = _lc_kind(_lc_of(codes)) if lifecycle else "rollout"
+                        if kind in ("review", "approved", "reject", "draft"):
+                            _apply_kind(kind, track_name, nm)
+                        else:
+                            # rollout / unknown（无 lifecycle 兜底）：灰度中，可全量发布
+                            release_now = True
+                            review_msgs.append(f"{track_name}:分阶段发布中 ({nm})")
+                            pending_entries.append((nm, "rollout"))
                     else:
-                        review_msgs.append(f"{track_name}:审核中 ({nm})")
-                        if nm and nm not in reviewing_names:
-                            reviewing_names.append(nm)
+                        _apply_kind("review", track_name, nm)
                 elif status == "draft":
-                    review_msgs.append(f"{track_name}:草稿未送审 ({nm})")
-                    if nm and nm not in draft_names:
-                        draft_names.append(nm)
+                    # 新接口可能把草稿/被拒的 release 也标成 draft status，按 lifecycle 校正
+                    if track_name == "production" and lifecycle:
+                        kind = _lc_kind(_lc_of(codes))
+                        if kind in ("review", "reject"):
+                            _apply_kind(kind, track_name, nm)
+                        else:
+                            _apply_kind("draft", track_name, nm)
+                    else:
+                        _apply_kind("draft", track_name, nm)
                 elif status == "completed":
                     if track_name == "production":
-                        prod_completed.append(
-                            {"name": nm, "codes": codes, "semver": _semver(name)}
-                        )
+                        # lifecycle 可纠正 completed：审核中/待发布/被拒的新版本也可能是 completed
+                        kind = _lc_kind(_lc_of(codes)) if lifecycle else "unknown"
+                        if kind in ("review", "approved", "reject", "draft"):
+                            _apply_kind(kind, track_name, nm)
+                        else:
+                            # rollout=PUBLISHED 已被新接口确认；unknown=lifecycle 不可用，
+                            # 仍需商店页面版本复核
+                            prod_completed.append(
+                                {"name": nm, "codes": codes, "semver": _semver(name),
+                                 "lc_published": bool(lifecycle) and kind == "rollout"}
+                            )
                     else:
                         # 内测/测试轨道单独收集
                         if track_name == "beta" and nm and nm not in beta_names:
@@ -500,9 +677,12 @@ class GoogleAdapter(StoreAdapter):
         # 因此用页面版本对 production 的 completed 发布做复核。
         page_ver = ""
         page_semver = None
-        # 只要有正式版发布（completed 或分阶段 inProgress），就用商店页面版本复核，
-        # 保证「已上架」始终显示真正在商店生效的版本。
-        if prod_completed or release_now:
+        # 有任何正式版发布动作（completed / 灰度中 / 审核中 / 待发布 / 被拒）时，
+        # 都用商店页面版本复核。注意：新版本 completed 后 tracks.list 会把旧的在架
+        # release 移除（只返回新版本），此时必须靠页面版本保住「已上架版本」显示。
+        need_page = bool(prod_completed or release_now or pending_entries
+                         or reviewing_names or rejected_names)
+        if need_page:
             page_ver = self._play_page_version(package_name)
             page_semver = _semver(page_ver)
 
@@ -510,6 +690,17 @@ class GoogleAdapter(StoreAdapter):
             for cand in prod_completed:
                 nm = cand["name"]
                 sv = cand["semver"]
+                if cand.get("lc_published"):
+                    # 新接口已明确 PUBLISHED：直接信任上架，不再用滞后的商店页面
+                    # 版本复核（全量发布后页面有传播延迟，否则会把新版本误判成审核中）。
+                    if nm and nm not in live_names:
+                        live_names.append(nm)
+                    for c in cand["codes"]:
+                        try:
+                            live_codes.append(int(c))
+                        except (TypeError, ValueError):
+                            pass
+                    continue
                 if sv is not None and page_semver is not None and sv == page_semver:
                     if nm and nm not in live_names:
                         live_names.append(nm)
@@ -542,8 +733,13 @@ class GoogleAdapter(StoreAdapter):
             if prod_completed:
                 audit_note = "未能核对商店页面版本，已上架按提交状态显示"
 
-        # 状态优先级：分阶段发布中（待发布）> 审核中 > 已上架 > 草稿 > 未知
-        if pending_names:
+        pending_names = [nm for nm, _ in pending_entries]
+
+        # 状态优先级：审核未通过 > 待发布（灰度中/审核通过待发） > 审核中 > 已上架 > 草稿 > 未知
+        # 被驳回排在最前（最需要人工介入）；旧版本仍在架时 live_names 照常展示。
+        if rejected_names:
+            state = AuditState.REJECTED
+        elif pending_entries:
             state = AuditState.PENDING
         elif reviewing_names:
             state = AuditState.REVIEWING
@@ -556,16 +752,27 @@ class GoogleAdapter(StoreAdapter):
         else:
             state = AuditState.UNKNOWN
 
-        # 分阶段发布中 → 「待发布」的说明文字：
-        # 原因见上面 inProgress 分支注释（API 无法区分审核中/灰度中，百万分之一≈未发布）。
-        # 版本号只进 audit_note（审核状态行展示），不进 reviewing_names，避免又显示成「审核中」。
-        if pending_names:
-            audit_note = "；".join(
-                f"{nm} 分阶段发布中（百万分之一，点「全量发布」正式上线）" for nm in pending_names
-            )
+        # 审核状态行说明文字
+        note_parts: List[str] = []
+        for nm, kind in pending_entries:
+            if kind == "rollout":
+                note_parts.append(f"{nm} 分阶段发布中（百万分之一，点「全量发布」正式上线）")
+            else:
+                note_parts.append(f"{nm} 审核通过，待发布（请到 Play Console 确认/发布）")
+        if rejected_names:
+            note_parts.append("、".join(rejected_names) + " 审核未通过")
+        # 新 lifecycle 接口近期失败 → 显式告知当前状态为旧推断（避免静默误判灰度/审核）
+        lc_note = lifecycle_failure_note(package_name)
+        if lc_note:
+            note_parts.append(lc_note)
+        # 保留上面 else 分支设置的「未能核对商店页面版本」兜底提示（旧代码只在有
+        # pending 时才覆盖 audit_note，无条件 join 会把这条提示静默丢掉）
+        if audit_note:
+            note_parts.append(audit_note)
+        audit_note = "；".join(note_parts)
 
         # 自管式发布（Managed Publishing）：审核通过后 Google 不会自动上架，需手动发布。
-        if self.credentials.get("managed_publishing") and (reviewing_names or pending_names):
+        if self.credentials.get("managed_publishing") and (reviewing_names or pending_entries):
             audit_note = "自管式发布，审核通过后需在 Play Console 手动发布"
 
         extra = {}
@@ -609,26 +816,39 @@ class GoogleAdapter(StoreAdapter):
                 # 只处理正式发布轨道，避免误把 beta/internal 的分阶段发布也转成全量
                 if track.get("track") != "production":
                     continue
-                rels = track.get("releases", [])
-                changed = False
-                for rel in rels:
-                    if rel.get("status") == "inProgress":
-                        rel["status"] = "completed"
-                        rel.pop("userFraction", None)
-                        changed = True
-                if changed:
-                    service.edits().tracks().update(
-                        packageName=package_name, editId=edit_id,
-                        track=track["track"],
-                        body={"track": track["track"], "releases": rels},
-                    ).execute()
-                    updated = True
+                targets = [rel for rel in track.get("releases", [])
+                           if rel.get("status") == "inProgress"]
+                if not targets:
+                    continue
+
+                def _max_code(rel):
+                    try:
+                        return max(int(c) for c in (rel.get("versionCodes") or []))
+                    except (TypeError, ValueError):
+                        return -1
+
+                # production 同时只可能有一个灰度中的 release；万一有多个，
+                # 取版本号最大者，避免一次提交多个 completed。
+                target = max(targets, key=_max_code)
+                target["status"] = "completed"
+                target.pop("userFraction", None)
+                # 关键：body 只发要完成的这一个 release。旧代码把 list 返回的
+                # 全部 release（含上一个 completed 版本）原样回写，Google 校验
+                # 报 "Only one completed release is allowed."，导致全量发布一直
+                # 实际失败（commit 被拒、灰度比例维持百万分之一）。
+                # 只发当前 release 时，旧版本由 Google 自动替换下线。
+                service.edits().tracks().update(
+                    packageName=package_name, editId=edit_id,
+                    track=track["track"],
+                    body={"track": track["track"], "releases": [target]},
+                ).execute()
+                updated = True
             if not updated:
                 raise StoreError("没有处于分阶段发布（inProgress）的版本，无需全量发布")
             service.edits().commit(
                 packageName=package_name, editId=edit_id
             ).execute()
-            return {"message": "已全量发布（userFraction → 100%）"}
+            return {"message": "已全量发布（分阶段 → 100%）"}
         except StoreError:
             raise
         except Exception as e:

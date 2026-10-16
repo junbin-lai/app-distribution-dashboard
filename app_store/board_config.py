@@ -16,7 +16,7 @@
   }
 }
 
-- users 非空 = 开启登录鉴权；role 只有两种：admin（可发布）/ viewer（只读+查询）
+- users 非空 = 开启登录鉴权；role 三种：owner（超级管理员，可管理用户账号）/ admin（可发布）/ viewer（只读+查询）
 - feishu 段缺省时飞书功能整体关闭，不影响看板其他功能
 - 每次请求都重新读盘，改配置无需重启（飞书长连接除外，需重启生效）
 """
@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional
 
 _LOCK = threading.Lock()
 
-ROLES = ("admin", "viewer")
+ROLES = ("owner", "admin", "viewer")
 
 
 def _read_json(path: str) -> Dict[str, Any]:
@@ -119,10 +119,32 @@ def feishu_ready(path: str) -> bool:
     return bool(fs.get("app_id") and fs.get("app_secret"))
 
 
+def security_alert_chat_id(path: str) -> str:
+    """安全告警的接收会话（飞书私聊 chat_id）。与发布通知群（notify_chat_id）分开：
+    账号增删改/越权等敏感告警只发私聊，不进公共发布群。空串 = 未绑定。"""
+    fs = feishu_config(path)
+    return str(fs.get("security_chat_id") or "")
+
+
+def _atomic_write_json(path: str, cfg: Dict[str, Any]) -> None:
+    """原子写 JSON。写完对 tmp 强制 chmod 0o600 再 replace。
+
+    open(tmp,"w") 按默认 umask 创建（通常 644），os.replace 后目标文件继承 tmp
+    的权限——board.json 含飞书 app_secret 和密码哈希，不处理的话每次写都会把
+    手工收紧的权限（chmod 600）静默回退成 644。
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
 def save_feishu_fields(path: str, fields: Dict[str, Any]) -> bool:
     """把若干字段合并写回 board.json 的 feishu 段（原子替换，保留其余配置）。
 
-    供「@机器人 绑定通知群」指令在运行期回写 notify_chat_id 使用。
+    供「@机器人 绑定通知群」等指令在运行期回写 notify/security 配置使用。
     """
     with _LOCK:
         cfg = _read_json(path)
@@ -132,11 +154,23 @@ def save_feishu_fields(path: str, fields: Dict[str, Any]) -> bool:
         fs.update(fields)
         cfg["feishu"] = fs
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, path)
+            _atomic_write_json(path, cfg)
+            return True
+        except OSError:
+            return False
+
+
+def save_users(path: str, users: List[Dict[str, str]]) -> bool:
+    """整体替换 board.json 的 users 段（原子写，保留 feishu/session_days 等其余配置）。
+
+    供用户管理页面增删改账号使用；users 内的密码只写 password_sha256（哈希），
+    不接受明文落盘。写失败返回 False（调用方应提示用户）。
+    """
+    with _LOCK:
+        cfg = _read_json(path)
+        cfg["users"] = users
+        try:
+            _atomic_write_json(path, cfg)
             return True
         except OSError:
             return False

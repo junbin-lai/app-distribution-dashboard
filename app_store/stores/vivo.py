@@ -200,13 +200,15 @@ class VivoAdapter(StoreAdapter):
                         ("file", (apk_path.split("/")[-1], f, "application/vnd.android.package-archive")),
                     ]
                     body = make_multipart_monitor(fields, file_size, cb)
-                    resp = req.post(_DOMAIN, data=body, headers={"Content-Type": body.content_type}, timeout=600)
+                    # 连接 30s + 读取 1200s：vivo 上传本身慢（20-30 分钟），
+                    # 上传完服务器还要 MD5 校验/病毒扫描，600s 不够 → 提到 1200s
+                    resp = req.post(_DOMAIN, data=body, headers={"Content-Type": body.content_type}, timeout=(30, 1200))
                 finally:
                     f.close()
             else:
                 with open(apk_path, "rb") as f:
                     files = {"file": (apk_path.split("/")[-1], f, "application/vnd.android.package-archive")}
-                    resp = req.post(_DOMAIN, data=params, files=files, timeout=600)
+                    resp = req.post(_DOMAIN, data=params, files=files, timeout=(30, 1200))
         except req.exceptions.ConnectionError as e:
             raise StoreError(f"vivo 上传网络连接失败: {e}")
         except req.exceptions.Timeout as e:

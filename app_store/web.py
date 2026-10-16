@@ -14,9 +14,14 @@ API：
   POST /api/logout            退出登录
   POST /api/publish           {app_id, platform|all, dry_run}（admin）
   POST /api/status            {app_id, platform?}（viewer 可用）
+  GET  /api/users             用户列表（仅 owner）
+  POST /api/users             {username, password, role} 新增（仅 owner，密码自动哈希落盘）
+  POST /api/users/update      {username, password?, role?} 改密码/角色（仅 owner）
+  POST /api/users/delete      {username} 删除（仅 owner）
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -257,6 +262,22 @@ def _history_path():
     return p
 
 
+def _preserve_mode(tmp: str, path: str) -> None:
+    """原子写防权限回退：让 tmp 继承目标文件的现有权限（目标不存在时 600）。
+
+    open(tmp,"w") 按默认 umask 创建（通常 644），os.replace 后目标文件会继承
+    tmp 的权限——不处理的话每次写都会把手工收紧的权限（如 chmod 600）静默回退。
+    """
+    try:
+        mode = os.stat(path).st_mode & 0o777
+    except OSError:
+        mode = 0o600
+    try:
+        os.chmod(tmp, mode)
+    except OSError:
+        pass
+
+
 def _load_history():
     """启动时把 config/tasks_history.json 里的历史任务加载进 _TASKS（供前端展示）。"""
     try:
@@ -289,6 +310,7 @@ def _save_history():
         tmp = _history_path() + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(items, f, ensure_ascii=False, indent=1)
+        _preserve_mode(tmp, _history_path())
         os.replace(tmp, _history_path())
     except Exception:
         pass
@@ -492,6 +514,13 @@ def _publish_worker(tid: str):
                     _step(tid, f"  {key}: {msg}")
                 rel.metadata["_progress_cb"] = _progress_cb
                 rel.metadata["_step_cb"] = _step_cb
+
+                # 纯停止检查（无日志副作用）：给上传后长等待环节用（如 Google
+                # AAB processing 轮询最长 5 分钟，期间无进度/步骤回调，停止请求
+                # 原先只能等到轮询结束才生效）
+                def _kill_cb():
+                    _check_kill(tid)
+                rel.metadata["_kill_cb"] = _kill_cb
                 res = adapter.publish(rel, dry_run=dry_run)
                 ok = bool(res.ok)
                 item = {"platform": key, "ok": ok, "message": res.message,
@@ -606,6 +635,16 @@ def _session_drop(token: str) -> None:
         _SESSIONS.pop(token, None)
 
 
+def _session_drop_by_user(username: str) -> None:
+    """踢掉某用户的全部现有会话（改密码/改角色/删账号后调用，强制重新登录）。
+
+    role 存在会话里，改角色必须踢会话才能生效；改密码/删账号同理。
+    """
+    with _session_lock:
+        for k in [k for k, v in _SESSIONS.items() if v.get("username") == username]:
+            _SESSIONS.pop(k, None)
+
+
 def _read_cookie(handler: BaseHTTPRequestHandler, name: str) -> str:
     raw = handler.headers.get("Cookie") or ""
     try:
@@ -650,6 +689,19 @@ def _same_origin(handler: BaseHTTPRequestHandler) -> bool:
         return (o.netloc or "") == host
     except Exception:
         return False
+
+
+def _users_to_save(users: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """把 list_users() 的结果规范成写回格式：统一转 password_sha256，明文密码不落盘。"""
+    out: List[Dict[str, str]] = []
+    for u in users:
+        e = {"username": u["username"], "role": u["role"]}
+        if u.get("password_sha256"):
+            e["password_sha256"] = u["password_sha256"]
+        elif u.get("password"):
+            e["password_sha256"] = hashlib.sha256(u["password"].encode("utf-8")).hexdigest()
+        out.append(e)
+    return out
 
 
 # ---- 状态查询 / 图标解析（HTTP 接口与飞书机器人共用）----
@@ -866,10 +918,12 @@ def resolve_app_icon(app_id: str) -> Optional[bytes]:
         tmp_path = cache_path + ".tmp"
         with open(tmp_path, "wb") as f:
             f.write(data)
+        _preserve_mode(tmp_path, cache_path)
         os.replace(tmp_path, cache_path)
         tmp_src = src_marker + ".tmp"
         with open(tmp_src, "w", encoding="utf-8") as f:
             f.write(icon_ref)
+        _preserve_mode(tmp_src, src_marker)
         os.replace(tmp_src, src_marker)
     except OSError:
         pass  # 缓存写失败不影响本次结果
@@ -913,12 +967,14 @@ _audit_lock = threading.Lock()
 _AUDIT_PATHS = {
     "/api/login", "/api/logout", "/api/publish", "/api/build/upload",
     "/api/apps/update", "/api/release-now", "/api/tasks/stop", "/api/tasks/clear",
+    "/api/users", "/api/users/update", "/api/users/delete",
 }
 _AUDIT_ACTION_NAMES = {
     "/api/login": "登录", "/api/logout": "退出登录", "/api/publish": "发布应用",
     "/api/build/upload": "上传安装包", "/api/apps/update": "修改应用配置",
     "/api/release-now": "华为立即上线", "/api/tasks/stop": "停止发布任务",
     "/api/tasks/clear": "清空发布历史",
+    "/api/users": "新增用户", "/api/users/update": "修改用户", "/api/users/delete": "删除用户",
 }
 
 
@@ -943,6 +999,27 @@ def _client_ip(handler: BaseHTTPRequestHandler) -> str:
         return str(handler.client_address[0]) if handler.client_address else ""
     except Exception:
         return ""
+
+
+# 用户管理接口集合：审计在各 handler 内做（需带操作明细），不走 _check_auth 的通用成功审计
+_USER_MGMT_PATHS = {"/api/users", "/api/users/update", "/api/users/delete"}
+# 用户管理读-改-写串行锁：list_users 在 save_users 的锁外读，并发增删改交错会
+# 用旧快照整体覆盖 users 段（丢失更新：新建账号消失/被删账号复活）。串行化后无窗口。
+_user_mgmt_lock = threading.Lock()
+
+
+def _security_alert(action: str, operator: str, ip: str, detail: str,
+                    ok: bool = True) -> None:
+    """账号增删改等安全敏感操作：写审计日志 + 实时私聊告警（独立线程，不阻塞业务）。
+
+    告警只发 owner 私聊绑定的 security_chat_id（机器人指令「绑定安全告警」），
+    不发公共发布群；未绑定时仅写审计日志。owner 账号一旦泄露被用来增删账号，
+    绑定者会立刻收到私聊告警。
+    """
+    _audit_log(action, operator, ip, ok, detail)
+    msg = (f"⚠️ 看板安全告警\n操作：{action}\n操作人：{operator or '?'}"
+           f"\nIP：{ip or '-'}\n结果：{'成功' if ok else '被拒绝'}\n详情：{detail or '-'}")
+    threading.Thread(target=feishu_bot.notify_security, args=(msg,), daemon=True).start()
 
 
 def _lan_addresses() -> List[str]:
@@ -1006,15 +1083,23 @@ class Handler(BaseHTTPRequestHandler):
                                user.get("username") or "?", _client_ip(self), False,
                                "跨站请求被拒绝")
                 return (403, "origin")
-            if user.get("role") != "admin":
-                if path in _AUDIT_PATHS:
+            if user.get("role") not in ("admin", "owner"):
+                if path in _USER_MGMT_PATHS:
+                    # viewer 试图碰用户管理接口：安全告警（可能是账号被盗后试探）
+                    _security_alert("用户管理越权尝试", user.get("username") or "?",
+                                    _client_ip(self),
+                                    f"{_AUDIT_ACTION_NAMES.get(path, path)}：只读账号尝试管理用户",
+                                    ok=False)
+                elif path in _AUDIT_PATHS:
                     _audit_log(_AUDIT_ACTION_NAMES.get(path, path),
                                user.get("username") or "?", _client_ip(self), False,
                                "viewer 只读账号尝试写操作被拒绝")
                 return (403, "role")
             # admin 的敏感写操作 → 记审计日志
-            # （登录/登出在各自接口里记；发布在 _api_publish 里记更细的参数）
-            if path in _AUDIT_PATHS and path not in ("/api/login", "/api/logout", "/api/publish"):
+            # （登录/登出在各自接口里记；发布在 _api_publish 里记更细的参数；
+            #  用户管理在各 handler 内带操作明细记，并做飞书告警）
+            if path in _AUDIT_PATHS and path not in (
+                    "/api/login", "/api/logout", "/api/publish") and path not in _USER_MGMT_PATHS:
                 _audit_log(_AUDIT_ACTION_NAMES.get(path, path),
                            user.get("username") or "?", _client_ip(self), True, "")
         return None
@@ -1059,6 +1144,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._api_share_image()
             if path == "/api/config":
                 return self._api_config()
+            if path == "/api/users":
+                return self._api_users()
             if path == "/api/validate":
                 return self._api_validate()
             if path == "/api/files":
@@ -1111,6 +1198,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._api_tasks_stop(body)
             if path == "/api/tasks/clear":
                 return self._api_tasks_clear(body)
+            if path == "/api/users":
+                return self._api_users_create(body)
+            if path == "/api/users/update":
+                return self._api_users_update(body)
+            if path == "/api/users/delete":
+                return self._api_users_delete(body)
             return _json_response(self, {"error": "not found"}, 404)
         except StoreError as e:
             return _json_response(self, {"ok": False, "error": str(e)}, 400)
@@ -1161,6 +1254,122 @@ class Handler(BaseHTTPRequestHandler):
         _set_cookie(self, _SESSION_COOKIE, "", 0)  # 立即过期
         self.end_headers()
         self.wfile.write(body_bytes)
+
+    # ---- 用户管理（仅 owner）----
+    def _require_owner(self) -> Optional[str]:
+        """用户管理接口的权限门槛：开启鉴权且当前会话是 owner。返回错误文案（None=放行）。"""
+        if not _auth_enabled():
+            return "未开启登录鉴权（本机直连模式没有账号体系，无用户可管理）"
+        user = _request_user(self)
+        if not user:
+            return "未登录或会话已过期，请先登录"
+        if user.get("role") != "owner":
+            # admin 越过了写操作门槛但尝试用户管理：安全告警（owner 账号权限边界被试探）
+            _security_alert("用户管理越权尝试", user.get("username") or "?",
+                            _client_ip(self),
+                            f"角色 {user.get('role')} 尝试访问 {urlparse(self.path).path}",
+                            ok=False)
+            return "仅 owner（超级管理员）账号可管理用户"
+        return None
+
+    def _api_users(self):
+        err = self._require_owner()
+        if err:
+            return _json_response(self, {"ok": False, "error": err}, 403)
+        users = [{"username": u["username"], "role": u["role"]}
+                 for u in board_config.list_users(self.board_config_path)]
+        return _json_response(self, {"ok": True, "users": users})
+
+    def _api_users_create(self, body: Dict[str, Any]):
+        err = self._require_owner()
+        if err:
+            return _json_response(self, {"ok": False, "error": err}, 403)
+        username = str(body.get("username") or "").strip()
+        password = str(body.get("password") or "")
+        role = str(body.get("role") or "").strip().lower()
+        with _user_mgmt_lock:
+            users = board_config.list_users(self.board_config_path)
+            if not username or len(username) > 32:
+                raise StoreError("用户名必填且不超过 32 个字符")
+            if any(u["username"] == username for u in users):
+                raise StoreError(f"用户名 {username} 已存在")
+            if len(password) < 6:
+                raise StoreError("密码至少 6 位")
+            if role not in board_config.ROLES:
+                raise StoreError("角色必须是 owner / admin / viewer")
+            users.append({
+                "username": username, "role": role,
+                "password_sha256": hashlib.sha256(password.encode("utf-8")).hexdigest(),
+            })
+            if not board_config.save_users(self.board_config_path, _users_to_save(users)):
+                raise StoreError("写入 board.json 失败（文件权限或磁盘问题）")
+        me = _request_user(self) or {}
+        _security_alert("新增用户", me.get("username") or "?", _client_ip(self),
+                        f"新增账号 {username}，角色 {role}")
+        return _json_response(self, {"ok": True, "username": username, "role": role})
+
+    def _api_users_update(self, body: Dict[str, Any]):
+        """改密码和/或角色（不改用户名）；变更后踢掉该用户现有会话强制重新登录。"""
+        err = self._require_owner()
+        if err:
+            return _json_response(self, {"ok": False, "error": err}, 403)
+        username = str(body.get("username") or "").strip()
+        password = str(body.get("password") or "")
+        role = str(body.get("role") or "").strip().lower()
+        with _user_mgmt_lock:
+            users = board_config.list_users(self.board_config_path)
+            target = next((u for u in users if u["username"] == username), None)
+            if not target:
+                raise StoreError(f"用户 {username or '?'} 不存在")
+            if password and len(password) < 6:
+                raise StoreError("密码至少 6 位")
+            if role and role not in board_config.ROLES:
+                raise StoreError("角色必须是 owner / admin / viewer")
+            new_role = role or target["role"]
+            if target["role"] == "owner" and new_role != "owner" \
+                    and sum(1 for u in users if u["role"] == "owner") <= 1:
+                raise StoreError("必须保留至少一个 owner 账号，不能降级最后一个 owner")
+            old_role = target["role"]
+            changed = []
+            if password:
+                target["password_sha256"] = hashlib.sha256(password.encode("utf-8")).hexdigest()
+                changed.append("重置密码")
+            if role and role != old_role:
+                target["role"] = role
+                changed.append(f"角色 {old_role} → {role}")
+            if not changed:
+                raise StoreError("没有需要修改的内容（请填写新密码或选择不同角色）")
+            if not board_config.save_users(self.board_config_path, _users_to_save(users)):
+                raise StoreError("写入 board.json 失败（文件权限或磁盘问题）")
+            _session_drop_by_user(username)
+        me = _request_user(self) or {}
+        _security_alert("修改用户", me.get("username") or "?", _client_ip(self),
+                        f"账号 {username}：{('，'.join(changed))}")
+        return _json_response(self, {"ok": True})
+
+    def _api_users_delete(self, body: Dict[str, Any]):
+        err = self._require_owner()
+        if err:
+            return _json_response(self, {"ok": False, "error": err}, 403)
+        username = str(body.get("username") or "").strip()
+        me = _request_user(self) or {}
+        if username == (me.get("username") or ""):
+            raise StoreError("不能删除当前登录的账号")
+        with _user_mgmt_lock:
+            users = board_config.list_users(self.board_config_path)
+            target = next((u for u in users if u["username"] == username), None)
+            if not target:
+                raise StoreError(f"用户 {username or '?'} 不存在")
+            if target["role"] == "owner" and sum(1 for u in users if u["role"] == "owner") <= 1:
+                raise StoreError("必须保留至少一个 owner 账号，不能删除最后一个 owner")
+            old_role = target["role"]
+            users = [u for u in users if u["username"] != username]
+            if not board_config.save_users(self.board_config_path, _users_to_save(users)):
+                raise StoreError("写入 board.json 失败（文件权限或磁盘问题）")
+            _session_drop_by_user(username)
+        _security_alert("删除用户", (me.get("username") or "?"), _client_ip(self),
+                        f"删除账号 {username}，原角色 {old_role}")
+        return _json_response(self, {"ok": True})
 
     def _api_config(self):
         user = _request_user(self)
@@ -1399,6 +1608,7 @@ class Handler(BaseHTTPRequestHandler):
                 json.dump(names, f, ensure_ascii=False, indent=1)
                 f.flush()
                 os.fsync(f.fileno())
+            _preserve_mode(tmp, path)
             os.replace(tmp, path)
         except Exception:
             try:

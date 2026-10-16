@@ -149,6 +149,37 @@ def send_message(app_id: str, app_secret: str, chat_id: str,
     _feishu_call(resp)
 
 
+def _notify_chat(config_path: str, chat_id: str, text: str) -> bool:
+    """给指定会话发一条文本消息（安全告警/绑定变更通知共用）。失败静默返回 False。"""
+    if not _LARK_OK or not chat_id:
+        return False
+    fs = board_config.feishu_config(config_path)
+    app_id_key, app_secret = fs.get("app_id", ""), fs.get("app_secret", "")
+    if not (app_id_key and app_secret):
+        return False
+    try:
+        send_message(app_id_key, app_secret, chat_id, "text",
+                     json.dumps({"text": text}, ensure_ascii=False))
+        return True
+    except Exception as e:
+        _log(f"消息发送失败(chat={chat_id}): {e}")
+        return False
+
+
+def notify_security(text: str) -> bool:
+    """安全告警（账号增删改/越权尝试等）发往绑定的私聊会话。
+
+    与发布通知群（notify_chat_id）严格分开：告警含操作人/IP/账号明细，
+    属敏感信息，只发 owner 私聊绑定的 security_chat_id，不进公共群。
+    未绑定/未配置/未装 SDK 时静默返回 False（审计日志仍会写）。
+    """
+    path = _ENV.get("board_config_path") or ""
+    chat_id = board_config.security_alert_chat_id(path)
+    if not chat_id:
+        return False
+    return _notify_chat(path, chat_id, text)
+
+
 def reply_message(app_id: str, app_secret: str, message_id: str,
                   msg_type: str, content: str) -> None:
     """回复某条消息（@指令的应答走这里，天然形成话题串）。"""
@@ -257,15 +288,17 @@ def build_result_post(app_name: str, image_key: str, at_user_id: str = "") -> Di
     }
 
 
-def build_help_text(apps: List[Dict[str, Any]], bound: bool) -> str:
+def build_help_text(apps: List[Dict[str, Any]], bound: bool, sec_bound: bool = False) -> str:
     names = "、".join(str(a.get("name") or a.get("id")) for a in apps[:20]) or "（目录为空）"
     bind_line = "已绑定本群" if bound else "未绑定（@我 发送「绑定通知群」开启发布通知）"
+    sec_line = "已绑定本会话" if sec_bound else "未绑定（私聊我 发送「绑定安全告警」，账号变更等安全事件只私聊通知你）"
     return (
         "我是 App 发布看板机器人 🤖\n"
         "用法：\n"
         "• @我 查询 <应用名> — 查该应用各平台状态，回复状态分享图\n"
         "• @我 查询 全部 — 逐个应用查询（较慢，耐心等）\n"
         f"• 发布通知群：{bind_line}\n"
+        f"• 安全告警：{sec_line}\n"
         f"可查询应用：{names}"
     )
 
@@ -423,6 +456,8 @@ def handle_command_text(
     reply,  # callable(msg_type, content) — 测试时可注入
     config_path: str,
     at_user_id: str = "",  # 提问者 open_id：群里回复时 @回他（私聊传空）
+    chat_type: str = "",   # p2p=私聊；绑定安全告警只允许私聊，防止绑到公共群
+    sender_open_id: str = "",  # 发送者 open_id（群聊/私聊都传）：安全告警绑定的身份凭据
 ) -> None:
     """解析并执行一条指令文本（@占位符已剥离或原样均可）。
 
@@ -433,13 +468,14 @@ def handle_command_text(
     apps = _list_apps()
     fs = board_config.feishu_config(config_path)
     bound = bool(fs.get("notify_chat_id"))
+    sec_bound = bool(fs.get("security_chat_id"))
 
     def _say(msg: str) -> None:
         """群聊里回话时带上 @提问者（私聊 at_user_id 为空则不带）。"""
         reply("text", json.dumps({"text": _at_prefix(at_user_id) + msg}, ensure_ascii=False))
 
     if not cmd or cmd in ("帮助", "help", "?", "？", "用法"):
-        _say(build_help_text(apps, bound))
+        _say(build_help_text(apps, bound, sec_bound))
         return
 
     if cmd in ("绑定通知群", "绑定群", "设为通知群"):
@@ -460,11 +496,67 @@ def handle_command_text(
             _say("❌ 写入配置失败。")
         return
 
+    if cmd in ("绑定安全告警", "绑定告警"):
+        # 安全告警含操作人/IP/账号明细，只允许绑定私聊会话，拒绝在群里绑定
+        if chat_type and chat_type != "p2p":
+            _say("❌ 安全告警只能绑定私聊会话（告警内容含敏感信息，不适合发到群里）。"
+                 "请私聊机器人发送「绑定安全告警」。")
+            return
+        # 身份校验：绑定后只有绑定者本人（security_owner_open_id）可改绑，
+        # 防止任意同事私聊一句就把告警劫持到自己那里
+        owner_id = str(fs.get("security_owner_open_id") or "")
+        old_chat = str(fs.get("security_chat_id") or "")
+        if not sender_open_id:
+            _say("❌ 未能识别发送者身份，无法绑定安全告警。")
+            return
+        if owner_id and sender_open_id != owner_id:
+            _log(f"安全告警绑定被拒绝：非绑定者本人尝试改绑 sender={sender_open_id}")
+            _notify_chat(config_path, old_chat,
+                         "⚠️ 有人尝试把安全告警改绑到其他会话，已被拒绝。"
+                         "如非你本人操作请尽快检查。")
+            _say("❌ 安全告警已由他人绑定，只有绑定者本人可以改绑。")
+            return
+        ok = board_config.save_feishu_fields(config_path, {
+            "security_chat_id": chat_id,
+            "security_owner_open_id": sender_open_id,
+        })
+        if ok:
+            _log(f"安全告警私聊已绑定: {chat_id} owner={sender_open_id}")
+            if old_chat and old_chat != chat_id:
+                _notify_chat(config_path, old_chat,
+                             "⚠️ 安全告警接收会话已被绑定者本人更换。")
+            _say("✅ 已把本私聊绑定为安全告警接收会话。账号增删改、越权尝试等"
+                 "安全事件会第一时间私聊发给你（不会发到发布通知群）。")
+        else:
+            _say("❌ 写入配置失败，请检查 config/board.json 是否可写。")
+        return
+
+    if cmd in ("解绑安全告警", "解绑告警"):
+        sec_chat = str(fs.get("security_chat_id") or "")
+        if not sec_chat:
+            _say("当前没有绑定安全告警。")
+            return
+        owner_id = str(fs.get("security_owner_open_id") or "")
+        if owner_id and sender_open_id and sender_open_id != owner_id:
+            _log(f"安全告警解绑被拒绝：非绑定者本人尝试解绑 sender={sender_open_id}")
+            _say("❌ 只有绑定者本人可以解绑安全告警。")
+            return
+        ok = board_config.save_feishu_fields(config_path, {
+            "security_chat_id": "",
+            "security_owner_open_id": "",
+        })
+        if ok:
+            _log("安全告警私聊已解绑")
+            _say("已取消安全告警的私聊绑定。")
+        else:
+            _say("❌ 写入配置失败。")
+        return
+
     # 查询指令：剥掉「查询/帮我/发布状态」等口语词后按应用名匹配
     keyword = clean_command_keyword(cmd)
 
     if not keyword:
-        _say(build_help_text(apps, bound))
+        _say(build_help_text(apps, bound, sec_bound))
         return
     if keyword.lower() in _ALL_WORDS:
         targets = apps
@@ -585,15 +677,15 @@ def _on_message(data) -> None:
         if _mentions_all(text, getattr(msg, "mentions", None)):
             _log(f"忽略 @所有人 消息（不触发机器人）chat={chat_id}")
             return
-        # 提问者 open_id：群聊里回复时 @回他（私聊不需要 @）
-        at_user_id = ""
-        if chat_type and chat_type != "p2p":
-            try:
-                at_user_id = str(getattr(getattr(data.event.sender, "sender_id", None),
+        # 发送者 open_id：群聊用于回复时 @回他；群聊/私聊都用于安全告警绑定身份校验
+        sender_open_id = ""
+        try:
+            sender_open_id = str(getattr(getattr(data.event.sender, "sender_id", None),
                                          "open_id", "") or "")
-            except Exception:
-                at_user_id = ""
-        _log(f"收到指令 chat={chat_id} type={chat_type} text={text!r} 提问者={at_user_id or '-'}")
+        except Exception:
+            sender_open_id = ""
+        at_user_id = sender_open_id if (chat_type and chat_type != "p2p") else ""
+        _log(f"收到指令 chat={chat_id} type={chat_type} text={text!r} 提问者={sender_open_id or '-'}")
         # 指令处理可能很慢（查询全平台状态），放线程里跑，不阻塞事件循环
         fs = board_config.feishu_config(_ENV["board_config_path"])
         app_id_key, app_secret = fs.get("app_id", ""), fs.get("app_secret", "")
@@ -606,7 +698,8 @@ def _on_message(data) -> None:
 
         threading.Thread(
             target=handle_command_text,
-            args=(text, chat_id, message_id, reply, _ENV["board_config_path"], at_user_id),
+            args=(text, chat_id, message_id, reply, _ENV["board_config_path"],
+                  at_user_id, chat_type, sender_open_id),
             daemon=True, name="feishu-cmd",
         ).start()
     except Exception as e:
